@@ -144,11 +144,11 @@ class AgenticLLM:
                ) -> LLMResponse:
         """
         非流式调用LLM，返回完整响应对象。
-        :param reasoning_effort: 思考强度
+        :param messages: 消息列表，格式为 [{"role": "user", "content": "..."}]
         :param enable_thinking: 是否启动思考模式
-        :param messages: 消息列表
+        :param reasoning_effort: 思考强度
         :param kwargs:
-        :return:
+        :return: LLMResponse
         """
         logger.info(f"正在调用 {self.model} 模型...")
         # 准备请求参数
@@ -163,59 +163,33 @@ class AgenticLLM:
 
         return self._adapter.invoke(messages, **kwargs)
 
-    def invoke_with_tools(self, messages, tools, tool_choice, param) -> LLMToolResponse:
-        pass
+    def invoke_with_tools(self,
+                          messages: List[Dict[str, str]],
+                          tools: List[Dict],
+                          tool_choice: Optional[str] = "auto",
+                          enable_thinking: bool = False,
+                          reasoning_effort: Optional[str] = None,
+                          **kwargs
+                          ) -> LLMToolResponse:
+        """
+        非流式调用LLM(Function Calling)，返回完整响应对象。
 
+        :param messages: 消息列表，格式为 [{"role": "user", "content": "..."}]
+        :param tools: 工具 schema 列表，格式为 OpenAI Function Calling 规范
+        :param tool_choice: 工具选择策略
+                                - auto: 模型自主选择调用
+        :param enable_thinking: 是否启动思考模式
+        :param reasoning_effort: 思考强度
+        :param kwargs:
+        :return: LLMResponse
+        """
+        # 合并参数
+        kwargs["tool_choice"] = tool_choice
+        if not hasattr(kwargs, "temperature"):
+            kwargs["temperature"] = self.temperature
 
-from serpapi import SerpApiClient
+        return self._adapter.invoke_with_tools(messages, tools, **kwargs)
 
-def search(query: str) -> str:
-    """
-        一个基于SerpApi的实战网页搜索引擎工具。
-        它会智能地解析搜索结果，优先返回直接答案或知识图谱信息。
-    """
-    logger.info("正在执行 [SerpApi] 网页搜索: {query}")
-    try:
-        api_key = os.getenv("SERPAPI_API_KEY")
-        if not api_key:
-            logger.error("SERPAPI_API_KEY 未在 .env 文件中配置。")
-
-        params = {
-            "engine": "google",
-            "q": query,
-            "gl": "cn",
-            "hl": "zh-cn",
-            "api_key": api_key,
-        }
-
-        # 搜索
-        client = SerpApiClient(params)
-        results = client.get_dict()
-
-        # 智能解析:优先寻找最直接的答案
-        if "answer_box_list" in results:
-            return "\n".join(results["answer_box_list"])
-
-        if "answer_box" in results and "answer" in results["answer_box"]:
-            return results["answer_box"]["answer"]
-
-        if "knowledge_graph" in results and "description" in results["knowledge_graph"]:
-            return results["knowledge_graph"]["description"]
-
-        if "organic_results" in results and results["organic_results"]:
-            # 如果没有直接答案，则返回前三个有机结果的摘要
-            snippets = [
-                f"[{i + 1}] {res.get('title', '')}\n{res.get('snippet', '')}"
-                for i, res in enumerate(results["organic_results"][:3])
-            ]
-            return "\n\n".join(snippets)
-
-        return f"对不起，没有找到关于 '{query}' 的信息。"
-
-    except Exception as e:
-        er = f"搜索时发生错误: {e}"
-        logger.error(er)
-        return er
 
 
 if __name__ == "__main__":

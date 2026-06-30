@@ -59,7 +59,7 @@ class Agent(ABC):
 
         return schemas
 
-    def _execute_tool_call(self, tool_name: str, arguments: Dict[str, Any]) -> str | None:
+    def _execute_tool_call(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """
         执行工具调用并返回字符串结果
         统一的工具执行逻辑，支持：
@@ -80,12 +80,13 @@ class Agent(ABC):
             try:
                 typed_args = self._convert_parameter_types(tool_name, arguments)
                 response = tool.run(typed_args)
+                return response.text
             except Exception as e:
                 logger.error(f"工具调用失败：{e}")
                 return f"工具调用失败：{e}"
 
         # TODO:解析函数工具
-        return response
+
 
 
     def _convert_parameter_types(self, tool_name: str, arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -141,6 +142,10 @@ class Agent(ABC):
                 # 整型
                 elif normalized in {"integer", "int"}:
                     converted[key] = int(value)
+                elif normalized in {"string", "str"}:
+                    converted[key] = str(value)
+                else:
+                    converted[key] = value
 
             except (TypeError, ValueError):
                 converted[key] = value

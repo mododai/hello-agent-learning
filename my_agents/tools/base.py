@@ -3,6 +3,8 @@ from typing import Dict, Any, List
 
 from pydantic import BaseModel
 
+from .response import ToolResponse
+
 
 class ToolParameter(BaseModel):
     """工具参数定义"""
@@ -27,7 +29,7 @@ class Tool(ABC):
 
 
     @abstractmethod
-    def run(self, parameters: Dict[str, Any]):
+    def run(self, parameters: Dict[str, Any]) -> ToolResponse:
         """执行"""
         raise NotImplementedError
 

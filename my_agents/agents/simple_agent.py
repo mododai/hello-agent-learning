@@ -66,7 +66,7 @@ class SimpleAgent(Agent):
         if not self.enable_tool_calling or not self.tool_registry:
             llm_response = self.llm.invoke(
                 messages=messages,
-                enable_thinking=False if not hasattr(kwargs, "enable_thinking") else kwargs["enable_thinking"],
+                enable_thinking=kwargs.pop("enable_thinking", False),
                 **kwargs
             )
             response_text = llm_response.content if hasattr(llm_response, 'content') else str(llm_response)
@@ -85,14 +85,15 @@ class SimpleAgent(Agent):
             current_iteration += 1
 
             try:
+                #current_tool_choice = "none" if messages and messages[-1].get("role") == "tool" else "auto"
                 response = self.llm.invoke_with_tools(
                     messages=messages,
                     tools=tool_schemas,
-                    tool_choice="auto",
+                    #tool_choice=current_tool_choice,
                     **kwargs,
                 )
             except Exception as e:
-                logger.error(f"LLM 调用失败: {e}")
+                logger.exception(f"LLM 调用失败: {e}")
                 break
 
             # 处理工具调用
@@ -135,12 +136,12 @@ class SimpleAgent(Agent):
                     })
                     continue
                 # 执行工具（复用基类方法）
-                result = self._execute_tool_call(tool_name, arg)
+                tool_content = self._execute_tool_call(tool_name, arg)
 
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
-                    "content": result
+                    "content": tool_content
                 })
 
         # 如果达到最大工具调用迭代轮次, llm没有收到最新的工具调用结果, 可以重新调用invoke

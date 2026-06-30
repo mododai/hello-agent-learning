@@ -1,6 +1,7 @@
 import time
 from typing import List, Dict, Iterator, Any, Optional
 
+from .llm_response import ToolCall
 from .base_adapter import BaseLLMAdapter
 import logging
 
@@ -117,7 +118,7 @@ class OpenAIAdapter(BaseLLMAdapter):
                         collected_content.append(content)
                         yield content
 
-                    if self._is_thinking_model(self.model, **kwargs):
+                    if self._is_thinking_model(**kwargs):
                         reasoning_delta = getattr(delta, "reasoning_content", None)
                         if reasoning_delta:
                             reasoning_content += reasoning_delta if reasoning_content else ""
@@ -138,8 +139,52 @@ class OpenAIAdapter(BaseLLMAdapter):
 
 
     def invoke_with_tools(self, messages: List[Dict], tools: List[Dict], **kwargs) -> LLMToolResponse:
-        pass
+        """工具调用(Function Calling)"""
+        if not self._client:
+            self._client = self.create_client()
 
+        try:
+            start = time.time()
+            response = self._client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                **kwargs
+            )
+
+            latency_ms = int((time.time() - start) * 1000)
+            tool_calls = [] #  LLM 调用的工具列表
+            message = response.choices[0].message
+
+            content = message.content or ""
+
+            if message:
+                for tc in message.tool_calls or []:
+                    tool_calls.append(
+                        ToolCall(
+                            id=tc.id,
+                            name=tc.function.name,
+                            arguments=tc.function.arguments,
+                        )
+                    )
+            usage = {}
+            if response.usage:
+                usage = {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens,
+                }
+
+            return LLMToolResponse(
+                content=content,
+                tool_calls=tool_calls,
+                model=response.model,
+                usage=usage,
+                latency_ms=latency_ms,
+            )
+        except Exception as e:
+            #logger.error(f"OpenAI Function Calling调用失败: {str(e)}")
+            raise RuntimeError(f"OpenAI Function Calling调用失败: {e}") from e
 
     def _is_thinking_model(self,**kwargs) -> True:
 
