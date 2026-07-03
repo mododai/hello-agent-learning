@@ -1,6 +1,5 @@
 from collections import Counter
 from datetime import datetime, timedelta
-from idlelib import query
 from typing import Dict, Any, List
 import heapq
 from ..base import BaseMemory, MemoryItem, MemoryConfig
@@ -9,29 +8,34 @@ logger = logging.getLogger(__name__)
 
 class WorkingMemory(BaseMemory):
     """
-    工作记忆
+    工作记忆实现。
+
+    特点：
+    1. 纯内存存储，适合短期上下文记忆。
+    2. 支持容量限制，超过容量时删除优先级最低的记忆。
+    3. 支持 TTL 自动过期清理。
+    4. 支持混合检索：TF-IDF 向量检索 + 关键词匹配。
     """
 
     def __init__(self, config: MemoryConfig = None, storage_backend=None):
         super().__init__(config, storage_backend)
 
-        self.max_capacity = config.working_memory_capacity or 50    # 最大保留记忆条数(默认50)
-        self.max_age_minutes = config.working_memory_ttl_minutes or 60
+        self.config = config or getattr(self, 'config', None)
+
+        self.max_capacity = getattr(self.config, "working_memory_capacity", 50) or 50
+        self.max_age_minutes = getattr(self.config, "working_memory_ttl_minutes", 60) or 60
 
         self.memories : List[MemoryItem] = []
-
-        self.memory_heap = []   # 优先队列(priority, timestamp, memory_item)
 
 
     def add(self, memory_item: MemoryItem) -> str:
         # 清理过期记忆
         self._expire_od_memories()
-        # 计算优先级
-        priority = self._calculate_priority(memory_item)
-        # 放入堆中
-        heapq.heappush(self.memory_heap, (-priority, memory_item.timestamp, memory_item))
 
         self.memories.append(memory_item)
+
+        if len(self.memories) > self.max_capacity:
+            self._remove_lowest_priority()
 
         return memory_item.id
 
@@ -76,21 +80,63 @@ class WorkingMemory(BaseMemory):
         scored_memories.sort(key=lambda x: x[0], reverse=True)
         return [memory for _, memory in scored_memories[:limit]]
 
-    def update(self, memory_id: str, content: str = None, importance: float = None,
-               metadata: Dict[str, Any] = None) -> bool:
-        pass
+    def update(self,
+               memory_id: str,
+               content: str = None,
+               importance: float = None,
+               metadata: Dict[str, Any] = None
+               ) -> bool:
+
+        for memory in self.memories:
+            if memory.id != memory_id:
+                continue
+
+            if content is not None:
+                memory.content = content
+            if importance is not None:
+                memory.importance = importance
+            if metadata is not None:
+                memory.metadata = metadata
+
+            return True
+
+        return False
+
 
     def remove(self, memory_id: str) -> bool:
-        pass
-
+        """删除指定工作记忆"""
+        original_count = len(self.memories)
+        self.memories = [
+            memory for memory in self.memories
+            if memory.id != memory_id
+        ]
+        removed = len(self.memories) != original_count
+        return removed
     def has_memory(self, memory_id: str) -> bool:
-        pass
+        return any(memory_id == memory.id for memory in self.memories)
 
     def clear(self):
-        pass
+        self.memories.clear()
 
     def get_stats(self) -> Dict[str, Any]:
-        pass
+
+        self._expire_od_memories()
+
+        active_memories = self.memories
+        return {
+            "count": len(active_memories),  # 活跃记忆数量
+            "forgotten_count": 0,  # 工作记忆中已遗忘的记忆会被直接删除
+            "total_count": len(self.memories),  # 总记忆数量
+            #"current_tokens": self.current_tokens,
+            "max_capacity": self.max_capacity,
+            #"max_tokens": self.max_tokens,
+            "max_age_minutes": self.max_age_minutes,
+            #"session_duration_minutes": (datetime.now() - self.session_start).total_seconds() / 60,
+            "avg_importance": sum(m.importance for m in active_memories) / len(active_memories) if active_memories else 0.0,
+            "capacity_usage": len(active_memories) / self.max_capacity if self.max_capacity > 0 else 0.0,
+            #"token_usage": self.current_tokens / self.max_tokens if self.max_tokens > 0 else 0.0,
+            "memory_type": "working"
+        }
 
     def _expire_od_memories(self) -> None:
         if not self.memories:
@@ -107,13 +153,8 @@ class WorkingMemory(BaseMemory):
         if len(kept) == len(self.memories):
             # 没有过期记忆
             return
-
         # 覆盖
         self.memories = kept
-        # 重新建堆
-        for memory in self.memories:
-            priority = self._calculate_priority(memory)
-            heapq.heappush(self.memory_heap, (-priority, memory.timestamp, memory))
 
 
 
@@ -127,10 +168,13 @@ class WorkingMemory(BaseMemory):
 
     def _calculate_time_decay(self, timestamp) -> float:
         """计算时间衰减"""
+        if timestamp is None:
+            return 1.0
+        decay_factor = getattr(self.config, "decay_factor", 0.95) or 0.95
         time_diff = datetime.now() - timestamp
-        hours, remainder = divmod(time_diff.seconds, 3600)
+        hours = max(time_diff.total_seconds() / 3600, 0)
 
-        decay_factor = self.config.decay_factor ** (hours / 6)
+        decay_factor = decay_factor ** (hours / 6)
         return decay_factor
 
     def _try_tfidf_search(self, query: str):
@@ -223,7 +267,7 @@ class WorkingMemory(BaseMemory):
             ]
         except Exception as e:
             logger.error(f"未导入库 jieba 或 jieba分词失败: {e}")
-            return {}
+            return []
 
     def _stopword(self, word: str) -> bool:
         """
@@ -294,5 +338,19 @@ class WorkingMemory(BaseMemory):
 
         return min(score, 1.0)  # 最大为 1
 
-        return keyword_score
+
+    def _remove_lowest_priority(self):
+        if not self.memories:
+            return
+
+        lowest_priority = float('inf')
+        lowest_memory = None
+
+        for memory in self.memories:
+            priority = self._calculate_priority(memory)
+            if priority < lowest_priority:
+                lowest_priority = priority
+                lowest_memory = memory
+        if lowest_priority:
+            self.remove(lowest_memory.id)
 
