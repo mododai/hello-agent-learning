@@ -1,3 +1,6 @@
+"""
+工作记忆是记忆系统中最活跃的部分，它负责存储当前对话会话中的临时信息
+"""
 from collections import Counter
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
