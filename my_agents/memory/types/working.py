@@ -1,5 +1,6 @@
 """
-工作记忆是记忆系统中最活跃的部分，它负责存储当前对话会话中的临时信息
+工作记忆:
+    -记忆系统中最活跃的部分，负责存储当前对话会话中的临时信息
 """
 from collections import Counter
 from datetime import datetime, timedelta
@@ -31,7 +32,10 @@ class WorkingMemory(BaseMemory):
         self.memories : List[MemoryItem] = []
 
 
-    def add(self, memory_item: MemoryItem) -> str:
+    def add(self, memory_item: MemoryItem) -> str | None:
+        if memory_item.memory_type != self.memory_type:
+            return None
+
         # 清理过期记忆
         self._expire_od_memories()
 

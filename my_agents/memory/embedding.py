@@ -92,9 +92,11 @@ def get_embedding_model() -> EmbeddingModel:
         embed_model_type = os.getenv("EMBED_MODEL_TYPE", "Ollama")
         if embed_model_type == "Ollama":
             _embedding_model = LocalOllamaEmbeddingModel(
-                model=os.getenv("EMBED_MODEL_MODEL", "Ollama"),
+                model=os.getenv("EMBED_MODEL_MODEL", os.getenv("OLLAMA_EMBED_MODEL", "qwen3-embedding:4b")),
                 base_url=os.getenv("EMBED_MODEL_BASE_URL", "http://localhost:11434"),
             )
+        else:
+            raise ValueError(f"不支持的 embedding 模型类型: {embed_model_type}")
     return _embedding_model
 
 def get_dimension(default: 384):

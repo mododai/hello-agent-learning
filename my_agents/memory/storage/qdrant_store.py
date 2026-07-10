@@ -273,7 +273,8 @@ class QdrantVectorStore:
                     continue
 
                 meta_with_timestamp = meta.copy()
-                meta_with_timestamp["timestamp"] = int(datetime.now().timestamp())
+                # 保留业务时间戳，另行记录向量索引写入时间。
+                meta_with_timestamp.setdefault("indexed_at", int(datetime.now().timestamp()))
 
                 if "external" in meta_with_timestamp and not isinstance(meta_with_timestamp.get("external"), bool):
                     # normalize to bool

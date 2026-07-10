@@ -1,5 +1,6 @@
 """
-情景记忆负责存储具体的事件和经历，它的设计重点在于保持事件的完整性和时间序列关系
+情景记忆:
+    -负责存储具体的事件和经历，它的设计重点在于保持事件的完整性和时间序列关系
 """
 import logging
 from pydantic import BaseModel
@@ -60,8 +61,11 @@ class EpisodicMemory(BaseMemory):
             distance=os.getenv("QDRANT_DISTANCE", "cosine")
         )
 
-    def add(self, memory_item: MemoryItem) -> str:
+    def add(self, memory_item: MemoryItem) -> str | None:
         """添加情景记忆"""
+        if memory_item.memory_type != self.memory_type:
+            return None
+
         # 从元数据中提取情景信息
         session_id = memory_item.metadata.get("session_id", "default_session")
         context = memory_item.metadata.get("context", {})
@@ -91,7 +95,7 @@ class EpisodicMemory(BaseMemory):
             memory_id=memory_item.id,
             user_id=memory_item.user_id,
             content=memory_item.content,
-            memory_type="episodic",
+            memory_type=self.memory_type,
             timestamp=ts_int,
             importance=memory_item.importance,
             properties={
@@ -111,7 +115,7 @@ class EpisodicMemory(BaseMemory):
                 metadata=[{
                     "memory_id": memory_item.id,
                     "user_id": memory_item.user_id,
-                    "memory_type": "episodic",
+                    "memory_type": self.memory_type,
                     "importance": memory_item.importance,
                     "session_id": session_id,
                     "content": memory_item.content
@@ -141,7 +145,7 @@ class EpisodicMemory(BaseMemory):
             if query_vector and isinstance(query_vector[0], (list, tuple)):
                 query_vector = query_vector[0]
 
-            where = {"memory_type": "episodic"}
+            where = {"memory_type": self.memory_type}
             if user_id:
                 where["user_id"] = user_id
             # 命中的记忆
@@ -166,7 +170,7 @@ class EpisodicMemory(BaseMemory):
 
             # 用命中的 ID 读取权威记录，避免把 Qdrant payload 当作完整数据源。
             doc = self.doc_store.get_memory(memory_id)
-            if not doc or doc.get("memory_type") != "episodic":
+            if not doc or doc.get("memory_type") != self.memory_type:
                 continue
             if user_id and doc.get("user_id") != user_id:
                 continue
@@ -199,7 +203,7 @@ class EpisodicMemory(BaseMemory):
                     MemoryItem(
                         id=doc["memory_id"],
                         content=doc["content"],
-                        memory_type="episodic",
+                        memory_type=self.memory_type,
                         user_id=doc["user_id"],
                         timestamp=timestamp,
                         importance=importance,
@@ -236,7 +240,7 @@ class EpisodicMemory(BaseMemory):
 
         # 先读取权威记录：进程重启后，内存缓存可能尚未回填。
         doc = self.doc_store.get_memory(memory_id)
-        if not doc or doc.get("memory_type") != "episodic":
+        if not doc or doc.get("memory_type") != self.memory_type:
             return False
 
         # 元数据采用合并而不是覆盖，避免仅更新 outcome 时丢失 session_id 等字段。
@@ -299,7 +303,7 @@ class EpisodicMemory(BaseMemory):
                     metadata=[{
                         "memory_id": memory_id,
                         "user_id": latest_doc["user_id"],
-                        "memory_type": "episodic",
+                        "memory_type": self.memory_type,
                         "importance": latest_doc.get("importance", 0.5),
                         "session_id": latest_properties.get("session_id", "default_session"),
                         "content": latest_doc["content"],
@@ -346,7 +350,7 @@ class EpisodicMemory(BaseMemory):
         self.sessions.clear()
         self.patterns_cache.clear()
 
-        docs = self.doc_store.search_memories(memory_type="episodic", limit=10000)
+        docs = self.doc_store.search_memories(memory_type=self.memory_type, limit=10000)
         ids = [d["memory_id"] for d in docs]
         for mid in ids:
             self.doc_store.delete_memory(mid)
@@ -368,7 +372,7 @@ class EpisodicMemory(BaseMemory):
             vs_stats = {"store_type": "qdrant"}
 
         return {
-            "memory_type": "episodic",
+            "memory_type": self.memory_type,
             "vector_store": vs_stats,
             "document_store": {
                 k: v
