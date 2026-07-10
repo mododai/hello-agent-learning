@@ -44,9 +44,9 @@ class QdrantConnectionManager:
                         url=url,
                         api_key=api_key,
                         collection_name=collection_name,
-                        vector_size=vector_size,
-                        distance=distance,
-                        timeout=timeout,
+                        vector_size=int(os.getenv("QDRANT_VECTOR_SIZE", vector_size)),
+                        distance=os.getenv("QDRANT_DISTANCE", distance),
+                        timeout=int(os.getenv("QDRANT_TIMEOUT", timeout)),
                         **kwargs
                     )
                 else:
@@ -131,7 +131,23 @@ class QdrantVectorStore:
             self._ensure_collection()
         except Exception as e:
             logger.error(f"Qdrant连接失败: {e}")
-            raise
+
+    @staticmethod
+    def _to_point_id(memory_id: Any) -> Optional[Any]:
+        """将业务 memory_id 转换为 Qdrant point ID。
+
+        合法 UUID 直接使用；其他字符串采用确定性的 UUID5。写入和删除都
+        必须使用此方法，否则会产生无法删除的孤儿向量。
+        """
+        if isinstance(memory_id, int):
+            return memory_id
+        if not isinstance(memory_id, str):
+            return None
+        try:
+            uuid.UUID(memory_id)
+            return memory_id
+        except ValueError:
+            return str(uuid.uuid5(uuid.NAMESPACE_DNS, memory_id))
 
     def _ensure_collection(self):
         """确保集合存在，不存在则创建"""
@@ -264,16 +280,8 @@ class QdrantVectorStore:
                     val = meta_with_timestamp.get("external")
                     meta_with_timestamp["external"] = True if str(val).lower() in ("1", "true", "yes") else False
 
-                safe_id: Any
-                if isinstance(point_id, int):
-                    safe_id = point_id
-                elif isinstance(point_id, str):
-                    try:
-                        uuid.UUID(point_id)
-                        safe_id = point_id
-                    except ValueError:
-                        safe_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, point_id)) # uuid 的计算基于 (namespace, name)
-                else:
+                safe_id = self._to_point_id(point_id)
+                if safe_id is None:
                     logger.info(f"不支持 ID 类型{type(point_id)}")
                     continue
 
@@ -389,19 +397,24 @@ class QdrantVectorStore:
             logger.error(f"删除向量失败: {e}")
             return False
 
-    def delete_memories(self, memory_ids: List[str]):
+    def delete_memories(self, memory_ids: List[str]) -> bool:
         try:
             if not memory_ids:
-                return
-            point_ids = [
-                str(uuid.uuid5(uuid.NAMESPACE_DNS, memory_id))
-                for memory_id in memory_ids
-            ]
-            self.delete_vectors(point_ids)
+                return True
+            point_ids = []
+            for memory_id in memory_ids:
+                point_id = self._to_point_id(memory_id)
+                if point_id is None:
+                    logger.warning("跳过不支持的 memory_id 类型: %s", type(memory_id))
+                    continue
+                point_ids.append(point_id)
+
+            deleted = self.delete_vectors(point_ids)
             logger.info(f"成功按memory_id删除 {len(memory_ids)} 个Qdrant向量")
+            return deleted
         except Exception as e:
             logger.error(f"删除记忆失败: {e}")
-            raise
+            return False
 
     def get_collection_info(self) -> Dict[str, Any]:
         """
@@ -414,6 +427,7 @@ class QdrantVectorStore:
             collection_info: CollectionInfo = self.client.get_collection(self.collection_name)
 
             info = {
+                "store_type": "qdrant",
                 "name": self.collection_name,
                 "vectors_count": collection_info.vectors_count,
                 "indexed_vectors_count": collection_info.indexed_vectors_count,

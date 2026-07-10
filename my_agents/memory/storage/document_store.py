@@ -235,15 +235,15 @@ class SQLiteDocumentStore(DocumentStore):
         update_fields = []
         params = []
 
-        if content:
+        if content is not None:
             update_fields.append("content = ?")
             params.append(content)
 
-        if importance:
+        if importance is not None:
             update_fields.append("importance = ?")
             params.append(importance)
 
-        if properties:
+        if properties is not None:
             update_fields.append("properties = ?")
             params.append(json.dumps(properties))
 
