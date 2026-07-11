@@ -9,6 +9,7 @@ from ..base import BaseMemory, MemoryConfig, MemoryItem
 from ..embedding import get_dimension, get_embedding_model
 from ..storage.document_store import SQLiteDocumentStore
 from ..storage.qdrant_store import QdrantConnectionManager
+from .semantic_fact import SemanticFact
 
 
 logger = logging.getLogger(__name__)
@@ -16,6 +17,10 @@ logger = logging.getLogger(__name__)
 
 class SemanticMemory(BaseMemory):
     """以 SQLite 为权威存储、Qdrant 为召回索引的语义记忆。"""
+
+    # 结构化事实仍然存放在通用 metadata 中，避免当前阶段修改 SQLite 表结构。
+    # 使用固定键名可以让后续的事实查重、替代和状态过滤拥有统一入口。
+    FACT_METADATA_KEY = "fact"
 
     def __init__(self, config: MemoryConfig, storage_backend=None):
         super().__init__(config, storage_backend)
@@ -76,6 +81,74 @@ class SemanticMemory(BaseMemory):
             raise ValueError("importance 必须在 0.0 到 1.0 之间")
         return value
 
+    @classmethod
+    def _normalize_metadata(cls, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """校验 metadata 中的结构化事实，并转换为可安全 JSON 序列化的数据。
+
+        SQLiteDocumentStore 最终使用 ``json.dumps`` 保存 properties，因此不能直接
+        写入 ``SemanticFact`` 对象或 ``datetime``。这里是写入边界：普通 metadata
+        原样复制；若存在 ``metadata["fact"]``，则先通过 Pydantic 完整校验，再使用
+        JSON 模式导出，使 datetime 自动转换为 ISO 8601 字符串。
+
+        Args:
+            metadata: 调用方提供的元数据，可为空，也可包含 SemanticFact 或字典。
+
+        Returns:
+            一个新的字典。该字典可以直接交给 SQLiteDocumentStore 序列化保存。
+
+        Raises:
+            TypeError: fact 既不是 SemanticFact，也不是字典。
+            pydantic.ValidationError: fact 字典不满足 SemanticFact 的字段约束。
+        """
+        normalized = dict(metadata or {})
+        raw_fact = normalized.get(cls.FACT_METADATA_KEY)
+
+        # metadata 中没有结构化事实时保持原有语义记忆行为，不强迫所有文本都结构化。
+        if raw_fact is None:
+            return normalized
+
+        if isinstance(raw_fact, SemanticFact):
+            fact = raw_fact
+        elif isinstance(raw_fact, dict):
+            # 字典也必须经过模型校验，不能让非法 confidence/status 悄悄进入数据库。
+            fact = SemanticFact.model_validate(raw_fact)
+        else:
+            raise TypeError(
+                "metadata['fact'] 必须是 SemanticFact 或可构造 SemanticFact 的字典"
+            )
+
+        # mode="json" 会把 datetime 等 Python 对象转换成 JSON 兼容值。
+        normalized[cls.FACT_METADATA_KEY] = fact.model_dump(mode="json")
+        return normalized
+
+    @classmethod
+    def _restore_metadata(cls, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """把 SQLite 读取出的 fact 字典还原为 SemanticFact 对象。
+
+        文档存储层只负责 JSON，不应该依赖具体业务模型。因此恢复动作放在
+        SemanticMemory 的读取边界完成。这样上层代码可以直接访问
+        ``memory.metadata["fact"].subject``，而不需要重复解析字典。
+        """
+        restored = dict(metadata or {})
+        raw_fact = restored.get(cls.FACT_METADATA_KEY)
+        if raw_fact is not None and not isinstance(raw_fact, SemanticFact):
+            restored[cls.FACT_METADATA_KEY] = SemanticFact.model_validate(raw_fact)
+        return restored
+
+    @classmethod
+    def get_fact(cls, memory_item: MemoryItem) -> Optional[SemanticFact]:
+        """从 MemoryItem 中读取结构化事实，没有 fact 时返回 None。
+
+        该方法同时兼容刚由调用方创建的 MemoryItem 和从 SQLite 恢复的 MemoryItem，
+        因此允许 fact 当前是模型对象或普通字典。
+        """
+        raw_fact = memory_item.metadata.get(cls.FACT_METADATA_KEY)
+        if raw_fact is None:
+            return None
+        if isinstance(raw_fact, SemanticFact):
+            return raw_fact
+        return SemanticFact.model_validate(raw_fact)
+
     def add(self, memory_item: MemoryItem) -> Optional[str]:
         if memory_item.memory_type != self.memory_type:
             raise ValueError(
@@ -86,6 +159,8 @@ class SemanticMemory(BaseMemory):
 
         content = self._validate_content(memory_item.content)
         importance = self._validate_importance(memory_item.importance)
+        # 在生成向量和写入任一存储之前校验事实，避免非法数据造成半条记忆。
+        metadata = self._normalize_metadata(memory_item.metadata)
         timestamp = int(memory_item.timestamp.timestamp())
         doc = {
             "memory_id": memory_item.id,
@@ -112,7 +187,7 @@ class SemanticMemory(BaseMemory):
                 memory_type=self.memory_type,
                 timestamp=timestamp,
                 importance=importance,
-                properties=dict(memory_item.metadata),
+                properties=metadata,
             )
         except Exception:
             # SQLite 写入失败时尽力回滚刚写入的向量。
@@ -172,7 +247,8 @@ class SemanticMemory(BaseMemory):
 
             vector_score = float(hit.get("score", 0.0))
             final_score = 0.85 * vector_score + 0.15 * importance
-            metadata = dict(doc.get("properties") or {})
+            # SQLite 中保存的是 JSON 字典；返回业务层前恢复成 SemanticFact 对象。
+            metadata = self._restore_metadata(doc.get("properties"))
             metadata.update(
                 {"vector_score": vector_score, "retrieval_score": final_score}
             )
@@ -220,6 +296,8 @@ class SemanticMemory(BaseMemory):
         new_properties = dict(doc.get("properties") or {})
         if metadata is not None:
             new_properties.update(metadata)
+            # 更新时也走同一校验/序列化边界，保证 add 与 update 契约一致。
+            new_properties = self._normalize_metadata(new_properties)
 
         # 内容变化时先更新向量；若 SQLite 更新失败则尽力恢复旧向量。
         if content is not None:

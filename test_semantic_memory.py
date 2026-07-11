@@ -6,6 +6,7 @@ from datetime import datetime
 from my_agents.memory.base import MemoryConfig, MemoryItem
 from my_agents.memory.storage.document_store import SQLiteDocumentStore
 from my_agents.memory.types.semantic import SemanticMemory
+from my_agents.memory.types.semantic_fact import SemanticFact
 
 
 class FakeEmbedder:
@@ -152,6 +153,97 @@ class SemanticMemoryTest(unittest.TestCase):
         self.assertFalse(self.memory.has_memory("m1"))
         self.assertTrue(self.memory.has_memory("m2"))
         self.assertEqual(self.memory.get_stats()["count"], 1)
+
+    def test_structured_fact_round_trip_through_sqlite(self):
+        """SemanticFact 写入 SQLite 后应能无损恢复成模型对象。"""
+        fact = SemanticFact(
+            subject="user",
+            predicate="drink_preference",
+            object="无糖拿铁",
+            knowledge_type="preference",
+            confidence=0.9,
+        )
+        item = self.item(
+            "fact-memory",
+            "u1",
+            "用户喜欢喝无糖拿铁",
+            metadata={"fact": fact, "source_message_id": "message-1"},
+        )
+
+        self.memory.add(item)
+
+        # SQLite 权威存储中必须是普通字典和字符串，证明数据可以被 JSON 序列化。
+        stored = self.memory.doc_store.get_memory("fact-memory")
+        self.assertIsInstance(stored["properties"]["fact"], dict)
+        self.assertIsInstance(stored["properties"]["fact"]["valid_from"], str)
+
+        # 业务检索结果应恢复为 SemanticFact，调用方不需要手动解析字典。
+        results = self.memory.retrieve("用户喜欢喝什么", user_id="u1")
+        restored = next(result for result in results if result.id == "fact-memory")
+        restored_fact = self.memory.get_fact(restored)
+        self.assertIsInstance(restored_fact, SemanticFact)
+        self.assertEqual(restored_fact.object, "无糖拿铁")
+        self.assertEqual(restored.metadata["source_message_id"], "message-1")
+
+    def test_fact_dictionary_is_validated_and_normalized(self):
+        """调用方传入字典时也必须执行 SemanticFact 的完整字段校验。"""
+        item = self.item(
+            "dict-fact",
+            "u1",
+            "用户正在学习 Python",
+            metadata={
+                "fact": {
+                    "subject": " user ",
+                    "predicate": " learning ",
+                    "object": " Python ",
+                    "knowledge_type": "skill",
+                }
+            },
+        )
+
+        self.memory.add(item)
+        stored = self.memory.doc_store.get_memory("dict-fact")
+        self.assertEqual(stored["properties"]["fact"]["subject"], "user")
+        self.assertEqual(stored["properties"]["fact"]["predicate"], "learning")
+        self.assertEqual(stored["properties"]["fact"]["object"], "Python")
+
+    def test_invalid_fact_is_rejected_before_vector_write(self):
+        """非法事实不能进入 Qdrant 或 SQLite，避免出现跨存储的半条数据。"""
+        item = self.item(
+            "invalid-fact",
+            "u1",
+            "一条非法事实",
+            metadata={
+                "fact": {
+                    "subject": "user",
+                    "predicate": "likes",
+                    "object": "茶",
+                    "confidence": 2.0,
+                }
+            },
+        )
+
+        with self.assertRaises(ValueError):
+            self.memory.add(item)
+
+        self.assertFalse(self.memory.has_memory("invalid-fact"))
+        self.assertNotIn("invalid-fact", self.vector_store.points)
+
+    def test_update_structured_fact(self):
+        """更新 metadata 中的 fact 时应校验并保存新的结构化事实。"""
+        self.memory.add(self.item("updated-fact", "u1", "用户喜欢拿铁"))
+        replacement = SemanticFact(
+            subject="user",
+            predicate="drink_preference",
+            object="无糖绿茶",
+            knowledge_type="preference",
+        )
+
+        self.assertTrue(
+            self.memory.update("updated-fact", metadata={"fact": replacement})
+        )
+        stored = self.memory.doc_store.get_memory("updated-fact")
+        self.assertEqual(stored["properties"]["fact"]["object"], "无糖绿茶")
 
 
 if __name__ == "__main__":
