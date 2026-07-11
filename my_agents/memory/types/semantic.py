@@ -149,6 +149,84 @@ class SemanticMemory(BaseMemory):
             return raw_fact
         return SemanticFact.model_validate(raw_fact)
 
+    @classmethod
+    def _memory_item_from_document(cls, doc: Dict[str, Any]) -> MemoryItem:
+        """把 SQLite 文档记录转换成统一的 MemoryItem。
+
+        ``find_active_fact`` 和向量检索都会从 SQLite 读取权威记录。把转换逻辑集中
+        在这里，可以确保 timestamp、importance 和 SemanticFact 的恢复规则一致，
+        避免不同读取路径返回形态不同的数据。
+        """
+        return MemoryItem(
+            id=doc["memory_id"],
+            content=doc["content"],
+            memory_type=doc["memory_type"],
+            user_id=doc["user_id"],
+            timestamp=datetime.fromtimestamp(doc["timestamp"]),
+            importance=float(doc.get("importance", 0.5)),
+            metadata=cls._restore_metadata(doc.get("properties")),
+        )
+
+    def find_active_fact(
+        self,
+        user_id: str,
+        subject: str,
+        predicate: str,
+        object_value: Optional[str] = None,
+    ) -> Optional[MemoryItem]:
+        """查找用户当前生效的结构化事实。
+
+        当前 SQLite 表还没有把 subject、predicate、status 拆成独立列，因此本阶段
+        先读取该用户的语义记忆并检查 properties 中的 fact。这个实现清晰、可靠，
+        适合学习阶段和小数据量；当事实规模增大后，再迁移为独立字段和数据库索引。
+
+        Args:
+            user_id: 事实所属用户。查询必须限定用户，防止跨用户去重和数据泄漏。
+            subject: 事实主体，例如 ``user``。
+            predicate: 主体属性或关系，例如 ``drink_preference``。
+            object_value: 可选的事实值。传入时要求 object 也相同；不传时只匹配
+                ``subject + predicate``，为下一步事实替代功能提供复用入口。
+
+        Returns:
+            第一条匹配的 active 事实；没有匹配时返回 None。
+        """
+        # 使用 SemanticFact 的字段校验规则完成去空格，避免 " user " 与 "user"
+        # 因格式差异绕过去重。临时 object 仅用于构造合法模型，不参与无值查询。
+        lookup_fact = SemanticFact(
+            subject=subject,
+            predicate=predicate,
+            object=object_value if object_value is not None else "__lookup__",
+        )
+
+        documents = self.doc_store.search_memories(
+            user_id=user_id,
+            memory_type=self.memory_type,
+            # 当前存储层尚不支持按 JSON 字段过滤，因此给出足够大的上限完成扫描。
+            # 后续拆分事实表时应使用数据库索引替代该扫描。
+            limit=1_000_000,
+        )
+        for doc in documents:
+            raw_fact = (doc.get("properties") or {}).get(self.FACT_METADATA_KEY)
+            if raw_fact is None:
+                # 普通文本语义记忆不参与结构化事实去重。
+                continue
+
+            try:
+                fact = SemanticFact.model_validate(raw_fact)
+            except Exception:
+                # 历史数据可能来自旧版本。单条损坏记录不应阻断其他事实的查询，
+                # 但记录警告，便于后续数据修复或索引重建。
+                logger.warning("跳过无法解析的语义事实: memory_id=%s", doc.get("memory_id"))
+                continue
+
+            if fact.status != "active" or fact.key != lookup_fact.key:
+                continue
+            if object_value is not None and fact.object != lookup_fact.object:
+                continue
+            return self._memory_item_from_document(doc)
+
+        return None
+
     def add(self, memory_item: MemoryItem) -> Optional[str]:
         if memory_item.memory_type != self.memory_type:
             raise ValueError(
@@ -161,6 +239,27 @@ class SemanticMemory(BaseMemory):
         importance = self._validate_importance(memory_item.importance)
         # 在生成向量和写入任一存储之前校验事实，避免非法数据造成半条记忆。
         metadata = self._normalize_metadata(memory_item.metadata)
+
+        # 只有结构化事实才执行确定性去重。普通文本没有稳定的 subject/predicate，
+        # 此时强行依靠文本或向量相似度去重容易把否定句、近义但不同的事实误合并。
+        raw_fact = metadata.get(self.FACT_METADATA_KEY)
+        if raw_fact is not None:
+            incoming_fact = SemanticFact.model_validate(raw_fact)
+            if incoming_fact.status == "active":
+                duplicate = self.find_active_fact(
+                    user_id=memory_item.user_id,
+                    subject=incoming_fact.subject,
+                    predicate=incoming_fact.predicate,
+                    object_value=incoming_fact.object,
+                )
+                if duplicate is not None:
+                    logger.info(
+                        "检测到重复语义事实，复用已有记忆: incoming_id=%s existing_id=%s",
+                        memory_item.id,
+                        duplicate.id,
+                    )
+                    return duplicate.id
+
         timestamp = int(memory_item.timestamp.timestamp())
         doc = {
             "memory_id": memory_item.id,

@@ -245,6 +245,140 @@ class SemanticMemoryTest(unittest.TestCase):
         stored = self.memory.doc_store.get_memory("updated-fact")
         self.assertEqual(stored["properties"]["fact"]["object"], "无糖绿茶")
 
+    def test_find_active_fact_by_key_and_optional_value(self):
+        """active 事实既可以按事实键查找，也可以进一步限定 object。"""
+        fact = SemanticFact(
+            subject="user",
+            predicate="drink_preference",
+            object="无糖拿铁",
+            knowledge_type="preference",
+        )
+        self.memory.add(
+            self.item(
+                "active-fact",
+                "u1",
+                "用户喜欢无糖拿铁",
+                metadata={"fact": fact},
+            )
+        )
+
+        by_key = self.memory.find_active_fact(
+            user_id="u1",
+            subject=" user ",
+            predicate=" drink_preference ",
+        )
+        by_value = self.memory.find_active_fact(
+            user_id="u1",
+            subject="user",
+            predicate="drink_preference",
+            object_value=" 无糖拿铁 ",
+        )
+        missing_value = self.memory.find_active_fact(
+            user_id="u1",
+            subject="user",
+            predicate="drink_preference",
+            object_value="无糖绿茶",
+        )
+
+        self.assertEqual(by_key.id, "active-fact")
+        self.assertEqual(by_value.id, "active-fact")
+        self.assertIsInstance(self.memory.get_fact(by_key), SemanticFact)
+        self.assertIsNone(missing_value)
+
+    def test_same_active_fact_reuses_existing_memory(self):
+        """完全相同的 active 事实不得重复调用 embedding 或写入两个存储。"""
+        first = self.item(
+            "first-fact",
+            "u1",
+            "用户喜欢喝无糖拿铁",
+            metadata={
+                "fact": SemanticFact(
+                    subject="user",
+                    predicate="drink_preference",
+                    object="无糖拿铁",
+                    knowledge_type="preference",
+                )
+            },
+        )
+        duplicate = self.item(
+            "duplicate-fact",
+            "u1",
+            "用户很喜欢不加糖的拿铁",
+            metadata={
+                "fact": {
+                    "subject": "user",
+                    "predicate": "drink_preference",
+                    "object": "无糖拿铁",
+                    "knowledge_type": "preference",
+                }
+            },
+        )
+
+        self.assertEqual(self.memory.add(first), "first-fact")
+        embedding_calls_after_first_add = len(self.embedder.calls)
+        self.assertEqual(self.memory.add(duplicate), "first-fact")
+
+        # 第二次添加应在生成向量前返回，所以 embedding 调用次数不变。
+        self.assertEqual(len(self.embedder.calls), embedding_calls_after_first_add)
+        self.assertFalse(self.memory.has_memory("duplicate-fact"))
+        self.assertNotIn("duplicate-fact", self.vector_store.points)
+        documents = self.memory.doc_store.search_memories(
+            user_id="u1", memory_type="semantic", limit=10
+        )
+        self.assertEqual([doc["memory_id"] for doc in documents], ["first-fact"])
+
+    def test_fact_deduplication_is_isolated_by_user(self):
+        """相同事实属于不同用户时必须分别保存，不能跨用户去重。"""
+        def preference(memory_id, user_id):
+            return self.item(
+                memory_id,
+                user_id,
+                "用户喜欢无糖拿铁",
+                metadata={
+                    "fact": SemanticFact(
+                        subject="user",
+                        predicate="drink_preference",
+                        object="无糖拿铁",
+                        knowledge_type="preference",
+                    )
+                },
+            )
+
+        self.assertEqual(self.memory.add(preference("u1-fact", "u1")), "u1-fact")
+        self.assertEqual(self.memory.add(preference("u2-fact", "u2")), "u2-fact")
+        self.assertTrue(self.memory.has_memory("u1-fact", user_id="u1"))
+        self.assertTrue(self.memory.has_memory("u2-fact", user_id="u2"))
+
+    def test_same_key_with_different_value_is_not_deduplicated_yet(self):
+        """本阶段只处理完全重复；不同 object 留给下一步 supersede 逻辑。"""
+        latte = SemanticFact(
+            subject="user",
+            predicate="drink_preference",
+            object="无糖拿铁",
+            knowledge_type="preference",
+        )
+        tea = SemanticFact(
+            subject="user",
+            predicate="drink_preference",
+            object="无糖绿茶",
+            knowledge_type="preference",
+        )
+
+        self.assertEqual(
+            self.memory.add(
+                self.item("latte", "u1", "用户喜欢拿铁", metadata={"fact": latte})
+            ),
+            "latte",
+        )
+        self.assertEqual(
+            self.memory.add(
+                self.item("tea", "u1", "用户喜欢绿茶", metadata={"fact": tea})
+            ),
+            "tea",
+        )
+        self.assertTrue(self.memory.has_memory("latte"))
+        self.assertTrue(self.memory.has_memory("tea"))
+
 
 if __name__ == "__main__":
     unittest.main()
