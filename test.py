@@ -1,4 +1,6 @@
 import logging
+import uuid
+
 from dotenv import load_dotenv
 import os
 import sys
@@ -10,8 +12,15 @@ if hasattr(sys.stderr, "reconfigure"):
 
 load_dotenv()
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.DEBUG,
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(name)s | "
+        "%(filename)s:%(lineno)d | "
+        "%(funcName)s | "
+        "%(message)s"
+    ),
 )
 
 logging.getLogger("my_agents").setLevel(logging.DEBUG)
@@ -69,7 +78,45 @@ def test_simple_agent_with_tool():
     print(history)
     print(r)
 
+
+def test_qdrant():
+    # test_qdrant_connection.py
+    from my_agents.memory.storage.qdrant_store import QdrantConnectionManager
+    from my_agents.memory.embedding import get_embedding_model, get_dimension
+
+
+    embedder = get_embedding_model()
+    dimension = get_dimension()
+    client =QdrantConnectionManager.get_instance(
+        url=os.getenv("QDRANT_URL"),
+        api_key=os.getenv("QDRANT_API_KEY"),
+        timeout=15,
+        vector_size=dimension,
+    )
+    collections = client.get_collection_info()
+    print(collections)
+    content = "我正在学习hello agent。"
+    vectors = embedder.encode(content)
+    id = 10086
+    client.add_vectors(
+        vectors=vectors,
+        metadata=[
+            {
+                "memory_id": str(id),
+                "user_id": "test_user",
+                "content": content,
+                "memory_type": "semantic",
+            }
+        ],
+        ids=[id]
+    )
+    client.delete_vectors(
+        ids=[id]
+    )
+
+
 if __name__ == "__main__":
     #test_llm_output()
     #test_simple_agent()
-    test_simple_agent_with_tool()
+    #test_simple_agent_with_tool()
+    test_qdrant()

@@ -77,7 +77,7 @@ class SemanticMemory(BaseMemory):
         return value
 
     def add(self, memory_item: MemoryItem) -> Optional[str]:
-        if not self.check_type(memory_item.memory_type):
+        if memory_item.memory_type != self.memory_type:
             raise ValueError(
                 f"SemanticMemory 不能保存 {memory_item.memory_type!r} 类型的记忆"
             )

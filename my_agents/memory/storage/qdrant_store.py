@@ -231,7 +231,7 @@ class QdrantVectorStore:
     def add_vectors(self,
                     vectors: List[List[float]],
                     metadata: List[Dict[str, Any]],
-                    ids: Optional[List[str]] = None,
+                    ids: Optional[List[str | int]] = None,
                     ) -> bool:
 
         """
@@ -305,8 +305,8 @@ class QdrantVectorStore:
             )
             logger.info("添加完成")
             return True
-        except Exception as e:
-            logger.error(f"添加向量失败: {e}")
+        except Exception:
+            logger.exception("添加向量失败")
             return False
 
     def search_similar(self,
@@ -355,7 +355,7 @@ class QdrantVectorStore:
                 score_threshold=score_threshold,    # 给相似度搜索结果设置一个最低相关性门槛，低于这个门槛的结果不返回
                 search_params=search_params,
                 with_payload=True,
-                with_value=False,
+                with_vectors=False,
 
             )
             search_points = res.points
@@ -375,7 +375,7 @@ class QdrantVectorStore:
             logger.error(f"向量搜索失败: {e}")
             return []
 
-    def delete_vectors(self, ids: List[str]) -> bool:
+    def delete_vectors(self, ids: List[str | int]) -> bool:
         """
         删除向量
         :param ids: 要删除的向量ID列表
@@ -395,7 +395,7 @@ class QdrantVectorStore:
             logger.info(f"成功删除 {len(ids)} 个向量")
             return True
         except Exception as e:
-            logger.error(f"删除向量失败: {e}")
+            logger.exception("删除向量失败")
             return False
 
     def delete_memories(self, memory_ids: List[str]) -> bool:
@@ -414,7 +414,7 @@ class QdrantVectorStore:
             logger.info(f"成功按memory_id删除 {len(memory_ids)} 个Qdrant向量")
             return deleted
         except Exception as e:
-            logger.error(f"删除记忆失败: {e}")
+            logger.exception("删除记忆失败")
             return False
 
     def get_collection_info(self) -> Dict[str, Any]:
@@ -430,7 +430,7 @@ class QdrantVectorStore:
             info = {
                 "store_type": "qdrant",
                 "name": self.collection_name,
-                "vectors_count": collection_info.vectors_count,
+                #"vectors_count": collection_info.vectors_count,
                 "indexed_vectors_count": collection_info.indexed_vectors_count,
                 "points_count": collection_info.points_count,
                 "segments_count": collection_info.segments_count,

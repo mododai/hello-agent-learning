@@ -99,7 +99,7 @@ def get_embedding_model() -> EmbeddingModel:
             raise ValueError(f"不支持的 embedding 模型类型: {embed_model_type}")
     return _embedding_model
 
-def get_dimension(default: 384):
+def get_dimension(default: int= 384):
     try:
         return int(getattr(get_embedding_model(), "dimension"))
     except Exception:
