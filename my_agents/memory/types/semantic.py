@@ -9,7 +9,9 @@ from ..base import BaseMemory, MemoryConfig, MemoryItem
 from ..embedding import get_dimension, get_embedding_model
 from ..storage.document_store import SQLiteDocumentStore
 from ..storage.qdrant_store import QdrantConnectionManager
+from .semantic_change import FactChange
 from .semantic_fact import SemanticFact
+from .semantic_policy import PredicatePolicy, PredicatePolicyRegistry
 
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,10 @@ class SemanticMemory(BaseMemory):
         # storage_backend 可用于测试或替换基础设施；正常运行时无需传入。
         backends = storage_backend if isinstance(storage_backend, dict) else {}
         self.embedder = backends.get("embedder") or get_embedding_model()
+        # 策略注册表允许调用方按业务扩展谓词，同时保持各实例之间相互隔离。
+        self.predicate_policies = (
+            backends.get("predicate_registry") or PredicatePolicyRegistry()
+        )
 
         db_dir = self.config.storage_path
         os.makedirs(db_dir, exist_ok=True)
@@ -227,7 +233,29 @@ class SemanticMemory(BaseMemory):
 
         return None
 
-    def add(self, memory_item: MemoryItem) -> Optional[str]:
+    def register_predicate_policy(
+        self,
+        predicate: str,
+        policy: PredicatePolicy,
+    ) -> None:
+        """为当前语义记忆实例注册谓词策略。"""
+        self.predicate_policies.register(predicate, policy)
+
+    def get_predicate_policy(self, predicate: str) -> PredicatePolicy:
+        """获取谓词策略；未知谓词使用默认的多值、显式替代策略。"""
+        return self.predicate_policies.get(predicate)
+
+    def _insert(
+        self,
+        memory_item: MemoryItem,
+        normalized_metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """执行单条语义记忆的底层双写，不包含去重或生命周期决策。
+
+        业务层 ``add``、``supersede_fact`` 都需要写入新记录。将真实写入集中在这里，
+        可以避免替代逻辑递归调用 add，也保证所有入口共享相同的校验和回滚行为。
+        Qdrant 先写入用于确认向量可用；SQLite 写入失败时删除刚写入的向量。
+        """
         if memory_item.memory_type != self.memory_type:
             raise ValueError(
                 f"SemanticMemory 不能保存 {memory_item.memory_type!r} 类型的记忆"
@@ -237,29 +265,11 @@ class SemanticMemory(BaseMemory):
 
         content = self._validate_content(memory_item.content)
         importance = self._validate_importance(memory_item.importance)
-        # 在生成向量和写入任一存储之前校验事实，避免非法数据造成半条记忆。
-        metadata = self._normalize_metadata(memory_item.metadata)
-
-        # 只有结构化事实才执行确定性去重。普通文本没有稳定的 subject/predicate，
-        # 此时强行依靠文本或向量相似度去重容易把否定句、近义但不同的事实误合并。
-        raw_fact = metadata.get(self.FACT_METADATA_KEY)
-        if raw_fact is not None:
-            incoming_fact = SemanticFact.model_validate(raw_fact)
-            if incoming_fact.status == "active":
-                duplicate = self.find_active_fact(
-                    user_id=memory_item.user_id,
-                    subject=incoming_fact.subject,
-                    predicate=incoming_fact.predicate,
-                    object_value=incoming_fact.object,
-                )
-                if duplicate is not None:
-                    logger.info(
-                        "检测到重复语义事实，复用已有记忆: incoming_id=%s existing_id=%s",
-                        memory_item.id,
-                        duplicate.id,
-                    )
-                    return duplicate.id
-
+        metadata = (
+            normalized_metadata
+            if normalized_metadata is not None
+            else self._normalize_metadata(memory_item.metadata)
+        )
         timestamp = int(memory_item.timestamp.timestamp())
         doc = {
             "memory_id": memory_item.id,
@@ -269,7 +279,6 @@ class SemanticMemory(BaseMemory):
             "importance": importance,
         }
 
-        # 先确保向量可生成、可写入，避免产生无法召回的 SQLite 记录。
         vectors = self._encode(content)
         if not self.vector_store.add_vectors(
             vectors=vectors,
@@ -289,11 +298,191 @@ class SemanticMemory(BaseMemory):
                 properties=metadata,
             )
         except Exception:
-            # SQLite 写入失败时尽力回滚刚写入的向量。
             self.vector_store.delete_memories([memory_item.id])
             raise
-
         return memory_item.id
+
+    def add(self, memory_item: MemoryItem) -> Optional[str]:
+        """添加语义记忆，并按谓词策略执行去重或单值事实替代。"""
+        if memory_item.memory_type != self.memory_type:
+            raise ValueError(
+                f"SemanticMemory 不能保存 {memory_item.memory_type!r} 类型的记忆"
+            )
+        if not memory_item.user_id.strip():
+            raise ValueError("user_id 不能为空")
+
+        content = self._validate_content(memory_item.content)
+        importance = self._validate_importance(memory_item.importance)
+        # 在生成向量和写入任一存储之前校验事实，避免非法数据造成半条记忆。
+        metadata = self._normalize_metadata(memory_item.metadata)
+
+        # 只有结构化事实才执行确定性去重。普通文本没有稳定的 subject/predicate，
+        # 此时强行依靠文本或向量相似度去重容易把否定句、近义但不同的事实误合并。
+        raw_fact = metadata.get(self.FACT_METADATA_KEY)
+        if raw_fact is None:
+            return self._insert(memory_item, metadata)
+
+        incoming_fact = SemanticFact.model_validate(raw_fact)
+        if incoming_fact.status != "active":
+            # 历史导入可能直接写入非 active 事实；它不参与当前事实决策。
+            return self._insert(memory_item, metadata)
+
+        existing = self.find_active_fact(
+            user_id=memory_item.user_id,
+            subject=incoming_fact.subject,
+            predicate=incoming_fact.predicate,
+        )
+        if existing is None:
+            return self._insert(memory_item, metadata)
+
+        existing_fact = self.get_fact(existing)
+        if existing_fact and existing_fact.has_same_value(incoming_fact):
+            logger.info(
+                "检测到重复语义事实，复用已有记忆: incoming_id=%s existing_id=%s",
+                memory_item.id,
+                existing.id,
+            )
+            return existing.id
+
+        policy = self.get_predicate_policy(incoming_fact.predicate)
+        if policy.cardinality == "single" and policy.replacement_mode == "automatic":
+            return self.supersede_fact(existing.id, memory_item)
+
+        # 多值或 explicit_only 谓词允许不同 object 同时保持 active。
+        return self._insert(memory_item, metadata)
+
+    def supersede_fact(
+        self,
+        old_memory_id: str,
+        new_memory_item: MemoryItem,
+        reason: Optional[str] = None,
+    ) -> str:
+        """使用新事实替代指定旧事实，并提供失败补偿。
+
+        新事实先写入，成功后才把旧事实标记为 superseded。若旧事实状态更新失败，
+        会删除新事实作为补偿，使旧事实继续保持 active，避免出现“当前事实消失”。
+        """
+        old_doc = self.doc_store.get_memory(old_memory_id)
+        if not old_doc or old_doc.get("memory_type") != self.memory_type:
+            raise ValueError(f"未找到待替代的语义记忆: {old_memory_id}")
+        if old_doc.get("user_id") != new_memory_item.user_id:
+            raise PermissionError("不能跨用户替代语义事实")
+
+        old_memory = self._memory_item_from_document(old_doc)
+        old_fact = self.get_fact(old_memory)
+        new_metadata = self._normalize_metadata(new_memory_item.metadata)
+        raw_new_fact = new_metadata.get(self.FACT_METADATA_KEY)
+        if old_fact is None or raw_new_fact is None:
+            raise ValueError("事实替代要求新旧记忆都包含 SemanticFact")
+
+        new_fact = SemanticFact.model_validate(raw_new_fact)
+        if old_fact.status != "active":
+            raise ValueError("只有 active 事实可以被替代")
+        if old_fact.key != new_fact.key:
+            raise ValueError("替代事实的 subject 和 predicate 必须与旧事实一致")
+        if old_fact.object == new_fact.object:
+            return old_memory_id
+
+        changed_at = new_memory_item.timestamp
+        new_fact = new_fact.model_copy(
+            update={
+                "status": "active",
+                "valid_from": changed_at,
+                "valid_to": None,
+                "supersedes": old_memory_id,
+            }
+        )
+        new_metadata[self.FACT_METADATA_KEY] = new_fact.model_dump(mode="json")
+        new_id = self._insert(new_memory_item, new_metadata)
+
+        old_fact = old_fact.model_copy(
+            update={"status": "superseded", "valid_to": changed_at}
+        )
+        old_metadata = dict(old_memory.metadata)
+        old_metadata[self.FACT_METADATA_KEY] = old_fact
+        if reason:
+            # 原因属于旧事实为何失效的审计信息，保存在旧记录上最容易追溯。
+            old_metadata["replacement_reason"] = reason
+        try:
+            if not self.update(
+                old_memory_id,
+                metadata=old_metadata,
+                user_id=new_memory_item.user_id,
+            ):
+                raise RuntimeError("旧事实状态更新失败")
+        except Exception:
+            self.remove(new_id, user_id=new_memory_item.user_id)
+            raise
+        return new_id
+
+    def retract_fact(
+        self,
+        memory_id: str,
+        user_id: str,
+        reason: Optional[str] = None,
+    ) -> bool:
+        """显式撤回一条 active 事实，但保留其历史记录和向量。"""
+        doc = self.doc_store.get_memory(memory_id)
+        if not doc or doc.get("memory_type") != self.memory_type:
+            return False
+        if doc.get("user_id") != user_id:
+            return False
+
+        memory_item = self._memory_item_from_document(doc)
+        fact = self.get_fact(memory_item)
+        if fact is None or fact.status != "active":
+            return False
+
+        retracted_fact = fact.model_copy(
+            update={"status": "retracted", "valid_to": datetime.now()}
+        )
+        metadata = dict(memory_item.metadata)
+        metadata[self.FACT_METADATA_KEY] = retracted_fact
+        if reason:
+            metadata["retraction_reason"] = reason
+        return self.update(memory_id, metadata=metadata, user_id=user_id)
+
+    def apply_fact_change(self, change: FactChange, memory_item: MemoryItem) -> Optional[str]:
+        """执行事实提取器产生的 assert/retract/replace 变更意图。"""
+        # 以 FactChange 中的事实为准，避免调用方 memory_item metadata 与操作意图不一致。
+        prepared_metadata = dict(memory_item.metadata)
+        prepared_metadata[self.FACT_METADATA_KEY] = change.fact
+        prepared_item = memory_item.model_copy(update={"metadata": prepared_metadata})
+
+        if change.operation == "assert":
+            return self.add(prepared_item)
+        if change.operation == "retract":
+            target = change.target_memory_id
+            if target is None:
+                existing = self.find_active_fact(
+                    user_id=memory_item.user_id,
+                    subject=change.fact.subject,
+                    predicate=change.fact.predicate,
+                    object_value=change.fact.object,
+                )
+                target = existing.id if existing else None
+            if target is None:
+                return None
+            return target if self.retract_fact(target, memory_item.user_id, change.reason) else None
+
+        target = change.target_memory_id
+        if target is None:
+            policy = self.get_predicate_policy(change.fact.predicate)
+            if policy.cardinality == "multiple":
+                # 多值谓词可能同时存在多个 active object。如果没有明确目标 ID，
+                # 任意选择一条替代会造成不可预测的数据丢失，因此要求调用方消除歧义。
+                raise ValueError("替换多值谓词事实时必须提供 target_memory_id")
+            existing = self.find_active_fact(
+                user_id=memory_item.user_id,
+                subject=change.fact.subject,
+                predicate=change.fact.predicate,
+            )
+            target = existing.id if existing else None
+        return (
+            self.supersede_fact(target, prepared_item, reason=change.reason)
+            if target
+            else self.add(prepared_item)
+        )
 
     def retrieve(
         self,
@@ -312,6 +501,7 @@ class SemanticMemory(BaseMemory):
         if min_importance is not None:
             min_importance = self._validate_importance(min_importance)
         score_threshold = kwargs.get("score_threshold")
+        include_inactive = bool(kwargs.get("include_inactive", False))
 
         where = {"memory_type": self.memory_type}
         if user_id:
@@ -344,12 +534,25 @@ class SemanticMemory(BaseMemory):
             if min_importance is not None and importance < min_importance:
                 continue
 
-            vector_score = float(hit.get("score", 0.0))
-            final_score = 0.85 * vector_score + 0.15 * importance
-            # SQLite 中保存的是 JSON 字典；返回业务层前恢复成 SemanticFact 对象。
             metadata = self._restore_metadata(doc.get("properties"))
+            fact = metadata.get(self.FACT_METADATA_KEY)
+            if isinstance(fact, SemanticFact) and fact.status != "active" and not include_inactive:
+                # Qdrant payload 可能仍包含历史向量；SQLite 的事实状态是最终权威。
+                continue
+
+            vector_score = float(hit.get("score", 0.0))
+            status_weight = {
+                "active": 1.0,
+                "superseded": 0.8,
+                "retracted": 0.6,
+            }.get(fact.status if isinstance(fact, SemanticFact) else "active", 1.0)
+            final_score = (0.85 * vector_score + 0.15 * importance) * status_weight
             metadata.update(
-                {"vector_score": vector_score, "retrieval_score": final_score}
+                {
+                    "vector_score": vector_score,
+                    "retrieval_score": final_score,
+                    "status_weight": status_weight,
+                }
             )
             results.append(
                 (
@@ -367,7 +570,16 @@ class SemanticMemory(BaseMemory):
             )
             seen_ids.add(memory_id)
 
-        results.sort(key=lambda item: item[0], reverse=True)
+        def result_sort_key(scored_item: Tuple[float, MemoryItem]) -> Tuple[int, float]:
+            """历史检索时先按状态分组，再在组内按相关性排序。"""
+            score, item = scored_item
+            item_fact = self.get_fact(item)
+            is_current = item_fact is None or item_fact.status == "active"
+            return (1 if is_current else 0, score)
+
+        # 即使某条历史事实的向量分更高，当前 active 事实也应整体排在历史之前；
+        # 默认检索已过滤历史，使用同一排序规则不会改变原有行为。
+        results.sort(key=result_sort_key, reverse=True)
         return [memory for _, memory in results[:limit]]
 
     def update(

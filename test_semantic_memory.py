@@ -349,8 +349,8 @@ class SemanticMemoryTest(unittest.TestCase):
         self.assertTrue(self.memory.has_memory("u1-fact", user_id="u1"))
         self.assertTrue(self.memory.has_memory("u2-fact", user_id="u2"))
 
-    def test_same_key_with_different_value_is_not_deduplicated_yet(self):
-        """本阶段只处理完全重复；不同 object 留给下一步 supersede 逻辑。"""
+    def test_multiple_value_fact_key_keeps_different_values_active(self):
+        """多值 drink_preference 的不同 object 应作为独立事实同时保留。"""
         latte = SemanticFact(
             subject="user",
             predicate="drink_preference",
