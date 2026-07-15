@@ -150,6 +150,58 @@ class SemanticFactLifecycleTest(unittest.TestCase):
             history[1].metadata["retrieval_score"],
         )
 
+    def test_structured_timeline_returns_only_current_and_superseded_predicate(self):
+        """城市时间线只返回当前和被替代城市，不得混入 active 饮品或撤回事实。"""
+        self.memory.add(
+            self.item("latte", "u1", "用户喜欢拿铁", self.fact("drink_preference", "拿铁"))
+        )
+        self.memory.add(
+            self.item("old-city", "u1", "用户住在杭州", self.fact("current_city", "杭州"))
+        )
+        self.memory.add(
+            self.item("new-city", "u1", "用户搬到上海", self.fact("current_city", "上海"))
+        )
+        self.memory.add(
+            self.item("old-skill", "u1", "用户会游泳", self.fact("skill", "游泳"))
+        )
+        self.memory.retract_fact("old-skill", "u1", "信息录入错误")
+
+        embedding_calls_before = len(self.embedder.calls)
+        timeline = self.memory.retrieve(
+            "用户现在住在哪里，以前住在哪里",
+            user_id="u1",
+            predicate="current_city",
+            retrieval_mode="timeline",
+            limit=10,
+        )
+
+        self.assertEqual([item.id for item in timeline], ["new-city", "old-city"])
+        self.assertEqual(
+            [self.memory.get_fact(item).status for item in timeline],
+            ["active", "superseded"],
+        )
+        # 结构化谓词检索直接查询 SQLite，不应产生额外 embedding 调用。
+        self.assertEqual(len(self.embedder.calls), embedding_calls_before)
+
+    def test_retracted_fact_is_only_visible_in_audit_mode(self):
+        """retracted 表示撤回记录，不应进入 current 或 timeline，只供 audit 审计。"""
+        self.memory.add(
+            self.item("swimming", "u1", "用户会游泳", self.fact("skill", "游泳"))
+        )
+        self.memory.retract_fact("swimming", "u1", "用户否认该信息")
+
+        current = self.memory.retrieve_facts("u1", "user", "skill", "current")
+        timeline = self.memory.retrieve_facts("u1", "user", "skill", "timeline")
+        audit = self.memory.retrieve_facts("u1", "user", "skill", "audit")
+
+        self.assertEqual(current, [])
+        self.assertEqual(timeline, [])
+        self.assertEqual([item.id for item in audit], ["swimming"])
+        self.assertEqual(self.memory.get_fact(audit[0]).status, "retracted")
+
+        with self.assertRaises(ValueError):
+            self.memory.retrieve_facts("u1", "user", "skill", "unknown")
+
     def test_explicit_retraction_preserves_history(self):
         """撤回偏好不删除记录，但默认检索不再返回它。"""
         self.memory.add(

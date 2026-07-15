@@ -3,7 +3,7 @@
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from ..base import BaseMemory, MemoryConfig, MemoryItem
 from ..embedding import get_dimension, get_embedding_model
@@ -17,12 +17,20 @@ from .semantic_policy import PredicatePolicy, PredicatePolicyRegistry
 logger = logging.getLogger(__name__)
 
 
+FactRetrievalMode = Literal["current", "timeline", "audit"]
+
+
 class SemanticMemory(BaseMemory):
     """以 SQLite 为权威存储、Qdrant 为召回索引的语义记忆。"""
 
-    # 结构化事实仍然存放在通用 metadata 中，避免当前阶段修改 SQLite 表结构。
-    # 使用固定键名可以让后续的事实查重、替代和状态过滤拥有统一入口。
+    # 事实同时保存在 semantic_facts 规范化表与 metadata 中。前者负责精确查询和
+    # 唯一约束，后者作为 MemoryItem 的兼容镜像，避免上层读取接口发生破坏性变化。
     FACT_METADATA_KEY = "fact"
+    FACT_RETRIEVAL_STATUSES = {
+        "current": ("active",),
+        "timeline": ("active", "superseded"),
+        "audit": ("active", "superseded", "retracted"),
+    }
 
     def __init__(self, config: MemoryConfig, storage_backend=None):
         super().__init__(config, storage_backend)
@@ -173,18 +181,17 @@ class SemanticMemory(BaseMemory):
             metadata=cls._restore_metadata(doc.get("properties")),
         )
 
-    def find_active_fact(
+    def find_active_facts(
         self,
         user_id: str,
         subject: str,
         predicate: str,
         object_value: Optional[str] = None,
-    ) -> Optional[MemoryItem]:
-        """查找用户当前生效的结构化事实。
+    ) -> List[MemoryItem]:
+        """查找用户当前生效的全部结构化事实。
 
-        当前 SQLite 表还没有把 subject、predicate、status 拆成独立列，因此本阶段
-        先读取该用户的语义记忆并检查 properties 中的 fact。这个实现清晰、可靠，
-        适合学习阶段和小数据量；当事实规模增大后，再迁移为独立字段和数据库索引。
+        正常 SQLite 路径直接查询 ``semantic_facts`` 索引列。扫描回退仅用于兼容
+        教学或测试中注入的简化 DocumentStore 实现。
 
         Args:
             user_id: 事实所属用户。查询必须限定用户，防止跨用户去重和数据泄漏。
@@ -194,7 +201,7 @@ class SemanticMemory(BaseMemory):
                 ``subject + predicate``，为下一步事实替代功能提供复用入口。
 
         Returns:
-            第一条匹配的 active 事实；没有匹配时返回 None。
+            所有匹配的 active 事实；没有匹配时返回空列表。
         """
         # 使用 SemanticFact 的字段校验规则完成去空格，避免 " user " 与 "user"
         # 因格式差异绕过去重。临时 object 仅用于构造合法模型，不参与无值查询。
@@ -204,13 +211,22 @@ class SemanticMemory(BaseMemory):
             object=object_value if object_value is not None else "__lookup__",
         )
 
+        if hasattr(self.doc_store, "find_semantic_facts"):
+            documents = self.doc_store.find_semantic_facts(
+                user_id=user_id,
+                subject=lookup_fact.subject,
+                predicate=lookup_fact.predicate,
+                object_value=lookup_fact.object if object_value is not None else None,
+                status="active",
+            )
+            return [self._memory_item_from_document(doc) for doc in documents]
+
         documents = self.doc_store.search_memories(
             user_id=user_id,
             memory_type=self.memory_type,
-            # 当前存储层尚不支持按 JSON 字段过滤，因此给出足够大的上限完成扫描。
-            # 后续拆分事实表时应使用数据库索引替代该扫描。
             limit=1_000_000,
         )
+        matches: List[MemoryItem] = []
         for doc in documents:
             raw_fact = (doc.get("properties") or {}).get(self.FACT_METADATA_KEY)
             if raw_fact is None:
@@ -229,16 +245,36 @@ class SemanticMemory(BaseMemory):
                 continue
             if object_value is not None and fact.object != lookup_fact.object:
                 continue
-            return self._memory_item_from_document(doc)
+            matches.append(self._memory_item_from_document(doc))
 
-        return None
+        return matches
+
+    def find_active_fact(
+        self,
+        user_id: str,
+        subject: str,
+        predicate: str,
+        object_value: Optional[str] = None,
+    ) -> Optional[MemoryItem]:
+        """返回一条 active 事实，仅供单值谓词或指定 object 的查询使用。"""
+        matches = self.find_active_facts(
+            user_id=user_id,
+            subject=subject,
+            predicate=predicate,
+            object_value=object_value,
+        )
+        return matches[0] if matches else None
 
     def register_predicate_policy(
         self,
         predicate: str,
         policy: PredicatePolicy,
     ) -> None:
-        """为当前语义记忆实例注册谓词策略。"""
+        """为当前实例注册谓词策略。
+
+        策略决定后续写入事实的 cardinality，不会隐式扫描或修改已经保存的事实。
+        因此业务初始化阶段应先注册策略，再开始写入该谓词的数据。
+        """
         self.predicate_policies.register(predicate, policy)
 
     def get_predicate_policy(self, predicate: str) -> PredicatePolicy:
@@ -288,6 +324,9 @@ class SemanticMemory(BaseMemory):
             raise RuntimeError("语义记忆向量写入失败")
 
         try:
+            raw_fact = metadata.get(self.FACT_METADATA_KEY)
+            fact = SemanticFact.model_validate(raw_fact) if raw_fact is not None else None
+            policy = self.get_predicate_policy(fact.predicate) if fact else None
             self.doc_store.add_memory(
                 memory_id=memory_item.id,
                 user_id=memory_item.user_id,
@@ -296,6 +335,8 @@ class SemanticMemory(BaseMemory):
                 timestamp=timestamp,
                 importance=importance,
                 properties=metadata,
+                semantic_fact=fact.model_dump(mode="json") if fact else None,
+                fact_cardinality=policy.cardinality if policy else None,
             )
         except Exception:
             self.vector_store.delete_memories([memory_item.id])
@@ -327,16 +368,16 @@ class SemanticMemory(BaseMemory):
             # 历史导入可能直接写入非 active 事实；它不参与当前事实决策。
             return self._insert(memory_item, metadata)
 
-        existing = self.find_active_fact(
+        # 先按完整四元组精确查重。多值谓词不能只检查任意一条同 key 事实，
+        # 否则已有“拿铁、绿茶”时再次添加“绿茶”可能因先看到拿铁而重复写入。
+        exact_matches = self.find_active_facts(
             user_id=memory_item.user_id,
             subject=incoming_fact.subject,
             predicate=incoming_fact.predicate,
+            object_value=incoming_fact.object,
         )
-        if existing is None:
-            return self._insert(memory_item, metadata)
-
-        existing_fact = self.get_fact(existing)
-        if existing_fact and existing_fact.has_same_value(incoming_fact):
+        if exact_matches:
+            existing = exact_matches[0]
             logger.info(
                 "检测到重复语义事实，复用已有记忆: incoming_id=%s existing_id=%s",
                 memory_item.id,
@@ -346,7 +387,14 @@ class SemanticMemory(BaseMemory):
 
         policy = self.get_predicate_policy(incoming_fact.predicate)
         if policy.cardinality == "single" and policy.replacement_mode == "automatic":
-            return self.supersede_fact(existing.id, memory_item)
+            current_matches = self.find_active_facts(
+                user_id=memory_item.user_id,
+                subject=incoming_fact.subject,
+                predicate=incoming_fact.predicate,
+            )
+            # 如果已经存在单值事实，则替换
+            if current_matches:
+                return self.supersede_fact(current_matches[0].id, memory_item)
 
         # 多值或 explicit_only 谓词允许不同 object 同时保持 active。
         return self._insert(memory_item, metadata)
@@ -393,7 +441,6 @@ class SemanticMemory(BaseMemory):
             }
         )
         new_metadata[self.FACT_METADATA_KEY] = new_fact.model_dump(mode="json")
-        new_id = self._insert(new_memory_item, new_metadata)
 
         old_fact = old_fact.model_copy(
             update={"status": "superseded", "valid_to": changed_at}
@@ -403,6 +450,48 @@ class SemanticMemory(BaseMemory):
         if reason:
             # 原因属于旧事实为何失效的审计信息，保存在旧记录上最容易追溯。
             old_metadata["replacement_reason"] = reason
+
+        # SQLiteDocumentStore 提供原子替代接口：旧事实失效与新事实插入在同一个事务
+        # 中完成。Qdrant 无法参与 SQLite 事务，因此先写向量，数据库失败时删除向量。
+        if hasattr(self.doc_store, "replace_memory_fact"):
+            content = self._validate_content(new_memory_item.content)
+            importance = self._validate_importance(new_memory_item.importance)
+            timestamp = int(new_memory_item.timestamp.timestamp())
+            new_doc = {
+                "memory_id": new_memory_item.id,
+                "user_id": new_memory_item.user_id,
+                "content": content,
+                "timestamp": timestamp,
+                "importance": importance,
+            }
+            if not self.vector_store.add_vectors(
+                vectors=self._encode(content),
+                metadata=[self._payload(new_doc)],
+                ids=[new_memory_item.id],
+            ):
+                raise RuntimeError("语义记忆向量写入失败")
+            policy = self.get_predicate_policy(new_fact.predicate)
+            try:
+                return self.doc_store.replace_memory_fact(
+                    old_memory_id=old_memory_id,
+                    old_properties=self._normalize_metadata(old_metadata),
+                    old_fact=old_fact.model_dump(mode="json"),
+                    new_memory_id=new_memory_item.id,
+                    user_id=new_memory_item.user_id,
+                    content=content,
+                    memory_type=self.memory_type,
+                    timestamp=timestamp,
+                    importance=importance,
+                    new_properties=new_metadata,
+                    new_fact=new_fact.model_dump(mode="json"),
+                    fact_cardinality=policy.cardinality,
+                )
+            except Exception:
+                self.vector_store.delete_memories([new_memory_item.id])
+                raise
+
+        # 简化的自定义 DocumentStore 没有事务接口时，保留原有补偿式实现。
+        new_id = self._insert(new_memory_item, new_metadata)
         try:
             if not self.update(
                 old_memory_id,
@@ -484,14 +573,88 @@ class SemanticMemory(BaseMemory):
             else self.add(prepared_item)
         )
 
+    @classmethod
+    def _validate_retrieval_mode(cls, mode: str) -> FactRetrievalMode:
+        """校验事实检索模式，避免未知模式被静默当成普通向量检索。"""
+        if mode not in cls.FACT_RETRIEVAL_STATUSES:
+            allowed = ", ".join(cls.FACT_RETRIEVAL_STATUSES)
+            raise ValueError(f"retrieval_mode 必须是以下值之一: {allowed}")
+        return mode
+
+    def retrieve_facts(
+        self,
+        user_id: str,
+        subject: str,
+        predicate: str,
+        retrieval_mode: FactRetrievalMode = "current",
+        object_value: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[MemoryItem]:
+        """按结构化事实键和生命周期意图进行确定性检索。
+
+        ``current`` 只返回 active；``timeline`` 返回 active 与 superseded，用于回答
+        “现在和以前”；``audit`` 额外返回 retracted，用于诊断或人工审计。该入口不调用
+        Embedding/Qdrant，因此不会让其他高相似度谓词混入同一条事实时间线。
+        """
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("结构化事实检索必须提供 user_id")
+        if limit <= 0:
+            return []
+        mode = self._validate_retrieval_mode(retrieval_mode)
+
+        # 借助 SemanticFact 的字段校验统一去除首尾空格，并拒绝空主体、谓词或 object。
+        lookup = SemanticFact(
+            subject=subject,
+            predicate=predicate,
+            object=object_value if object_value is not None else "__lookup__",
+        )
+        statuses = list(self.FACT_RETRIEVAL_STATUSES[mode])
+
+        if hasattr(self.doc_store, "find_semantic_facts"):
+            documents = self.doc_store.find_semantic_facts(
+                user_id=user_id.strip(),
+                subject=lookup.subject,
+                predicate=lookup.predicate,
+                object_value=lookup.object if object_value is not None else None,
+                status=None,
+                statuses=statuses,
+                limit=limit,
+            )
+            return [self._memory_item_from_document(doc) for doc in documents]
+
+        # 兼容只实现通用文档查询的教学测试替身；正常 SQLite 路径不会执行全量扫描。
+        documents = self.doc_store.search_memories(
+            user_id=user_id.strip(),
+            memory_type=self.memory_type,
+            limit=1_000_000,
+        )
+        results: List[MemoryItem] = []
+        for doc in documents:
+            item = self._memory_item_from_document(doc)
+            fact = self.get_fact(item)
+            if fact is None or fact.key != lookup.key or fact.status not in statuses:
+                continue
+            if object_value is not None and fact.object != lookup.object:
+                continue
+            results.append(item)
+
+        status_order = {status: index for index, status in enumerate(statuses)}
+        results.sort(
+            key=lambda item: (
+                status_order.get(self.get_fact(item).status, len(statuses)),
+                -item.timestamp.timestamp(),
+            )
+        )
+        return results[:limit]
+
     def retrieve(
         self,
-        query: str,
+        query: Optional[str] = None,
         limit: int = 5,
         user_id: Optional[str] = None,
         **kwargs,
     ) -> List[MemoryItem]:
-        query = self._validate_content(query)
+
         if limit <= 0:
             return []
 
@@ -502,6 +665,30 @@ class SemanticMemory(BaseMemory):
             min_importance = self._validate_importance(min_importance)
         score_threshold = kwargs.get("score_threshold")
         include_inactive = bool(kwargs.get("include_inactive", False))
+        retrieval_mode = kwargs.get(
+            "retrieval_mode",
+            "audit" if include_inactive else "current",
+        )
+        retrieval_mode = self._validate_retrieval_mode(retrieval_mode)
+
+        # 调用方已经从问题中识别出谓词时，优先走确定性事实检索。query 仍保留在统一
+        # retrieve 签名中，但不会再生成向量，也不会混入其他谓词的 active 事实。
+        predicate = kwargs.get("predicate")
+        if predicate is not None:
+            if not user_id:
+                raise ValueError("按 predicate 检索结构化事实时必须提供 user_id")
+            return self.retrieve_facts(
+                user_id=user_id,
+                subject=kwargs.get("subject", "user"),
+                predicate=predicate,
+                retrieval_mode=retrieval_mode,
+                object_value=kwargs.get("object_value"),
+                limit=limit,
+            )
+
+        query = self._validate_content(query)
+
+        allowed_statuses = self.FACT_RETRIEVAL_STATUSES[retrieval_mode]
 
         where = {"memory_type": self.memory_type}
         if user_id:
@@ -536,16 +723,21 @@ class SemanticMemory(BaseMemory):
 
             metadata = self._restore_metadata(doc.get("properties"))
             fact = metadata.get(self.FACT_METADATA_KEY)
-            if isinstance(fact, SemanticFact) and fact.status != "active" and not include_inactive:
-                # Qdrant payload 可能仍包含历史向量；SQLite 的事实状态是最终权威。
+            if isinstance(fact, SemanticFact) and fact.status not in allowed_statuses:
+                # Qdrant 只召回候选；事实是否符合当前、时间线或审计意图由 SQLite
+                # 中恢复出的生命周期状态决定。
                 continue
 
             vector_score = float(hit.get("score", 0.0))
-            status_weight = {
-                "active": 1.0,
-                "superseded": 0.8,
-                "retracted": 0.6,
-            }.get(fact.status if isinstance(fact, SemanticFact) else "active", 1.0)
+            status_weights = (
+                {"active": 1.0, "superseded": 1.0, "retracted": 0.0}
+                if retrieval_mode == "timeline"
+                else {"active": 1.0, "superseded": 0.8, "retracted": 0.6}
+            )
+            status_weight = status_weights.get(
+                fact.status if isinstance(fact, SemanticFact) else "active",
+                1.0,
+            )
             final_score = (0.85 * vector_score + 0.15 * importance) * status_weight
             metadata.update(
                 {
@@ -622,11 +814,20 @@ class SemanticMemory(BaseMemory):
                 return False
 
         try:
+            raw_fact = new_properties.get(self.FACT_METADATA_KEY)
+            fact = SemanticFact.model_validate(raw_fact) if raw_fact is not None else None
+            policy = self.get_predicate_policy(fact.predicate) if fact else None
             updated = self.doc_store.update_memory(
                 memory_id=memory_id,
                 content=new_content if content is not None else None,
                 importance=new_importance if importance is not None else None,
                 properties=new_properties if metadata is not None else None,
+                semantic_fact=(
+                    fact.model_dump(mode="json")
+                    if fact is not None and metadata is not None
+                    else None
+                ),
+                fact_cardinality=policy.cardinality if policy else None,
             )
         except Exception:
             if content is not None:
