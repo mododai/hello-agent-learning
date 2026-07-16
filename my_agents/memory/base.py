@@ -4,7 +4,7 @@
 """
 from datetime import datetime
 from typing import Dict, Any, List
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from abc import ABC, abstractmethod
 
 class MemoryItem(BaseModel):
@@ -15,7 +15,8 @@ class MemoryItem(BaseModel):
     user_id: str
     timestamp: datetime
     importance: float = 0.5
-    metadata: Dict[str, Any] = {}
+    # 每条记忆必须拥有独立的元数据字典，避免多个模型实例共享可变默认值。
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
     class Config:
         arbitrary_types_allowed = True
@@ -38,7 +39,9 @@ class MemoryConfig(BaseModel):
     working_memory_ttl_minutes: int = 120
 
     # 感知记忆特定配置
-    perceptual_memory_modalities: List[str] = ["text", "image", "audio", "video"]
+    perceptual_memory_modalities: List[str] = Field(
+        default_factory=lambda: ["text", "image", "audio", "video"]
+    )
 
 class BaseMemory(ABC):
     """

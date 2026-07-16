@@ -6,6 +6,7 @@ from .semantic_policy import (
     PredicatePolicyRegistry,
     ReplacementMode,
 )
+from .semantic_query import FactQuery, FactRetrievalMode
 
 __all__ = [
     "SemanticFact",
@@ -17,4 +18,6 @@ __all__ = [
     "PredicatePolicyRegistry",
     "FactCardinality",
     "ReplacementMode",
+    "FactQuery",
+    "FactRetrievalMode",
 ]

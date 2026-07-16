@@ -19,6 +19,10 @@
 - SQLite 约束失败时完整回滚，不留下半条记忆
 - `current / timeline / audit` 结构化事实检索模式
 - 城市时间线按谓词隔离，不混入 active 饮品，撤回事实仅在审计模式出现
+- `FactQuery` 查询契约、规则式自然语言规划和无法识别时的 Qdrant 回退
+- `MemoryManager` 对 working、episodic、semantic 三类记忆的统一路由
+- `MemoryTool` 的保存、聚合检索、更新、撤回、删除、统计和用户隔离
+- `SimpleAgent` 通过 Function Calling 保存、回传并再次召回完整记忆系统
 
 ## 运行命令
 
@@ -26,6 +30,18 @@
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+连接真实 Embedding、Qdrant 和临时 SQLite 验收完整记忆工具：
+
+```powershell
+.\.venv\Scripts\python.exe tests\real_memory_tool_check.py
+```
+
+连接真实 LLM 验证 `SimpleAgent → MemoryTool → MemoryManager` 工具调用闭环：
+
+```powershell
+.\.venv\Scripts\python.exe tests\real_agent_memory_tool_check.py
 ```
 
 同时运行旧测试和新验收测试：
@@ -41,5 +57,5 @@
 ## 测试边界
 
 测试使用 `FakeEmbedder` 和 `FakeVectorStore`，重点验证业务规则和 SQLite 持久化。
-Ollama 与 Qdrant Cloud 的网络连通性由根目录的 `test_embedding.py` 和 `test.py`
-单独验证，避免外部网络波动导致生命周期回归测试不稳定。
+Ollama 与 Qdrant Cloud 的完整工具链由 `real_memory_tool_check.py` 单独验证，避免
+外部网络波动导致离线回归测试不稳定。真实脚本使用唯一用户并在结束时清理测试数据。

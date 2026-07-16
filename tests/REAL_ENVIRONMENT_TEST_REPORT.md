@@ -27,8 +27,8 @@
 4. 第二次添加绿茶时复用原 memory ID，没有新增重复 SQLite 行或 Qdrant point。
 5. `current_city` 从杭州变为上海后，杭州为 `superseded`，上海为 `active`。
 6. Qdrant 语义检索可以召回当前事实。
-7. `predicate=current_city + retrieval_mode=timeline` 只返回上海和杭州，不混入饮品。
-8. `timeline` 不返回 retracted 技能，`audit` 可以返回该审计记录。
+7. 规则规划器把“现在和以前住在哪里”转换为 `current_city + timeline`，结果只含上海和杭州。
+8. 规则规划器把“审计撤回的技能记录”转换为 `skill + audit` 并返回撤回记录。
 9. 测试结束后按唯一用户清理数据。
 10. 清理后 SQLite 剩余测试事实为 0。
 11. 清理后 Qdrant 剩余测试 points 为 0。

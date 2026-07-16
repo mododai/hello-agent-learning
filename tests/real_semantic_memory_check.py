@@ -157,19 +157,15 @@ def main() -> None:
                 limit=10,
             )
             print("retrieval:", retrieval)
-            city_history = memory.retrieve(
+            city_history = memory.retrieve_natural_language(
                 "用户现在住在哪里，以前住在哪里",
                 user_id=user_id,
                 limit=10,
-                predicate="current_city",
-                retrieval_mode="timeline",
             )
-            skill_audit = memory.retrieve(
-                "审计用户的技能记录",
+            skill_audit = memory.retrieve_natural_language(
+                "审计用户撤回的技能记录",
                 user_id=user_id,
                 limit=10,
-                predicate="skill",
-                retrieval_mode="audit",
             )
             print("city_history:", city_history)
 
@@ -215,23 +211,26 @@ def main() -> None:
             if memory is not None:
                 # clear 按唯一 user_id 删除本次写入的 SQLite 行和 Qdrant points。
                 memory.clear(user_id=user_id)
-                remaining = memory.find_active_facts(
+                remaining_documents = memory.doc_store.search_memories(
                     user_id=user_id,
-                    subject="user",
-                    predicate="drink_preference",
+                    memory_type="semantic",
+                    limit=100,
                 )
-                if remaining:
-                    raise RuntimeError("真实环境测试清理失败：SQLite 仍有测试事实")
+                if remaining_documents:
+                    raise RuntimeError("真实环境测试清理失败：SQLite 仍有测试记忆")
 
-                # Qdrant 删除使用 wait=True，但仍显式按测试 user_id 反查，确保没有
-                # 留下孤立向量。该过滤条件不会读取或影响其他用户的 points。
-                cleanup_query = memory._single_vector(
-                    memory.embedder.encode("真实环境测试清理检查")
-                )
-                remaining_vectors = memory.vector_store.search_similar(
-                    query_vector=cleanup_query,
-                    limit=10,
-                    where={"memory_type": "semantic", "user_id": user_id},
+                # 不能使用 search_similar 验证清理，因为该封装在网络异常时会返回 []，
+                # 容易把“查询失败”误判成“清理成功”。这里直接按已知 point ID 调用
+                # Qdrant retrieve；网络异常会抛出，只有真实返回空列表才算清理完成。
+                point_ids = [
+                    memory.vector_store._to_point_id(memory_id)
+                    for memory_id in ids.values()
+                ]
+                remaining_vectors = memory.vector_store.client.retrieve(
+                    collection_name=memory.vector_store.collection_name,
+                    ids=point_ids,
+                    with_payload=True,
+                    with_vectors=False,
                 )
                 if remaining_vectors:
                     raise RuntimeError("真实环境测试清理失败：Qdrant 仍有测试向量")

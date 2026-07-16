@@ -22,9 +22,8 @@ class WorkingMemory(BaseMemory):
     """
 
     def __init__(self, config: MemoryConfig = None, storage_backend=None):
+        config = config or MemoryConfig()
         super().__init__(config, storage_backend)
-
-        self.config = config or getattr(self, 'config', None)
 
         self.max_capacity = getattr(self.config, "working_memory_capacity", 50) or 50
         self.max_age_minutes = getattr(self.config, "working_memory_ttl_minutes", 60) or 60
@@ -62,7 +61,8 @@ class WorkingMemory(BaseMemory):
         if not filtered_memories:
             return []
         # 计算TF-IDF向量检索
-        vector_stores = self._try_tfidf_search(query)
+        # 只使用当前用户的候选集建立 TF-IDF 词表，避免其他用户内容影响相关性评分。
+        vector_stores = self._try_tfidf_search(query, filtered_memories)
 
         # 计算综合分数
         scored_memories = []
@@ -77,7 +77,7 @@ class WorkingMemory(BaseMemory):
             base_relevance *= time_decay
 
             # 重要性权重
-            importance_weight = 0.8 + (memory.importance_weight * 0.4)
+            importance_weight = 0.8 + (memory.importance * 0.4)
 
             final_score = base_relevance * importance_weight
 
@@ -91,11 +91,14 @@ class WorkingMemory(BaseMemory):
                memory_id: str,
                content: str = None,
                importance: float = None,
-               metadata: Dict[str, Any] = None
+               metadata: Dict[str, Any] = None,
+               user_id: str = None,
                ) -> bool:
 
         for memory in self.memories:
             if memory.id != memory_id:
+                continue
+            if user_id is not None and memory.user_id != user_id:
                 continue
 
             if content is not None:
@@ -110,30 +113,46 @@ class WorkingMemory(BaseMemory):
         return False
 
 
-    def remove(self, memory_id: str) -> bool:
+    def remove(self, memory_id: str, user_id: str = None) -> bool:
         """删除指定工作记忆"""
         original_count = len(self.memories)
         self.memories = [
             memory for memory in self.memories
-            if memory.id != memory_id
+            if not (
+                memory.id == memory_id
+                and (user_id is None or memory.user_id == user_id)
+            )
         ]
         removed = len(self.memories) != original_count
         return removed
-    def has_memory(self, memory_id: str) -> bool:
-        return any(memory_id == memory.id for memory in self.memories)
+    def has_memory(self, memory_id: str, user_id: str = None) -> bool:
+        return any(
+            memory_id == memory.id
+            and (user_id is None or memory.user_id == user_id)
+            for memory in self.memories
+        )
 
-    def clear(self):
-        self.memories.clear()
+    def clear(self, user_id: str = None):
+        if user_id is None:
+            self.memories.clear()
+            return
+        self.memories = [
+            memory for memory in self.memories if memory.user_id != user_id
+        ]
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self, user_id: str = None) -> Dict[str, Any]:
 
         self._expire_od_memories()
 
-        active_memories = self.memories
+        active_memories = [
+            memory
+            for memory in self.memories
+            if user_id is None or memory.user_id == user_id
+        ]
         return {
             "count": len(active_memories),  # 活跃记忆数量
             "forgotten_count": 0,  # 工作记忆中已遗忘的记忆会被直接删除
-            "total_count": len(self.memories),  # 总记忆数量
+            "total_count": len(active_memories),  # 当前统计范围内的总记忆数量
             #"current_tokens": self.current_tokens,
             "max_capacity": self.max_capacity,
             #"max_tokens": self.max_tokens,
@@ -184,7 +203,11 @@ class WorkingMemory(BaseMemory):
         decay_factor = decay_factor ** (hours / 6)
         return decay_factor
 
-    def _try_tfidf_search(self, query: str):
+    def _try_tfidf_search(
+        self,
+        query: str,
+        memories: List[MemoryItem] = None,
+    ):
         """
         TF: 全称 Term Frequency, 即词频; 表示某个词在一篇文档中出现的频率。
         IDF: 全称是 Inverse Document Frequency, 即逆文档频率; 衡量一个词在所有文档中是否常见
@@ -196,7 +219,8 @@ class WorkingMemory(BaseMemory):
         if not query or not query.strip():
             return {}
 
-        if not self.memories:
+        candidates = self.memories if memories is None else memories
+        if not candidates:
             return {}
 
         try:
@@ -206,7 +230,7 @@ class WorkingMemory(BaseMemory):
             # 过滤空记忆
             valid_memories = [
                 memory
-                for memory in self.memories
+                for memory in candidates
                 if getattr(memory, "content", None) is not None
                    and str(memory.content).strip() != ""
             ]
@@ -216,7 +240,7 @@ class WorkingMemory(BaseMemory):
 
             documents = [
                 str(memory.content)
-                for memory in self.memories
+                for memory in valid_memories
             ]
 
             # TF-IDF 向量话器
@@ -358,6 +382,6 @@ class WorkingMemory(BaseMemory):
             if priority < lowest_priority:
                 lowest_priority = priority
                 lowest_memory = memory
-        if lowest_priority:
+        if lowest_memory is not None:
             self.remove(lowest_memory.id)
 

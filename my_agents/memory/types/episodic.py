@@ -31,6 +31,7 @@ class EpisodicMemory(BaseMemory):
 
     def __init__(self, config: MemoryConfig, storage_backend=None):
         super().__init__(config, storage_backend)
+        backends = storage_backend or {}
 
         # 本地缓存（内存）
         self.episodes: List[Episode] = []
@@ -44,22 +45,24 @@ class EpisodicMemory(BaseMemory):
         db_dir = self.config.storage_path if hasattr(self.config, 'storage_path') else "./memory_data"
         os.makedirs(db_dir, exist_ok=True)
         db_path = os.path.join(db_dir, "memory.db")
-        self.doc_store = SQLiteDocumentStore(db_path=db_path)
+        self.doc_store = backends.get("doc_store") or SQLiteDocumentStore(db_path=db_path)
 
         # 统一嵌入模型（多语言，默认384维）
-        self.embedder = get_embedding_model()
+        self.embedder = backends.get("embedder") or get_embedding_model()
 
         # 向量存储（Qdrant - 使用连接管理器避免重复连接）
         from ..storage.qdrant_store import QdrantConnectionManager
         qdrant_url = os.getenv("QDRANT_URL")
         qdrant_api_key = os.getenv("QDRANT_API_KEY")
-        self.vector_store = QdrantConnectionManager.get_instance(
-            url=qdrant_url,
-            api_key=qdrant_api_key,
-            collection_name=os.getenv("QDRANT_COLLECTION", "agents_vectors"),
-            vector_size=get_dimension(getattr(self.embedder, 'dimension', 384)),
-            distance=os.getenv("QDRANT_DISTANCE", "cosine")
-        )
+        self.vector_store = backends.get("vector_store")
+        if self.vector_store is None:
+            self.vector_store = QdrantConnectionManager.get_instance(
+                url=qdrant_url,
+                api_key=qdrant_api_key,
+                collection_name=os.getenv("QDRANT_COLLECTION", "agents_vectors"),
+                vector_size=get_dimension(getattr(self.embedder, 'dimension', 384)),
+                distance=os.getenv("QDRANT_DISTANCE", "cosine")
+            )
 
     def add(self, memory_item: MemoryItem) -> str | None:
         """添加情景记忆"""
@@ -232,7 +235,8 @@ class EpisodicMemory(BaseMemory):
                memory_id: str,
                content: str = None,
                importance: float = None,
-               metadata: Dict[str, Any] = None
+               metadata: Dict[str, Any] = None,
+               user_id: str = None,
                ) -> bool:
         """更新情景记忆；SQLite 为权威源，内容变更时同步重建向量索引。"""
         if content is None and importance is None and metadata is None:
@@ -241,6 +245,8 @@ class EpisodicMemory(BaseMemory):
         # 先读取权威记录：进程重启后，内存缓存可能尚未回填。
         doc = self.doc_store.get_memory(memory_id)
         if not doc or doc.get("memory_type") != self.memory_type:
+            return False
+        if user_id is not None and doc.get("user_id") != user_id:
             return False
 
         # 元数据采用合并而不是覆盖，避免仅更新 outcome 时丢失 session_id 等字段。
@@ -316,7 +322,14 @@ class EpisodicMemory(BaseMemory):
 
         return True
 
-    def remove(self, memory_id: str) -> bool:
+    def remove(self, memory_id: str, user_id: str = None) -> bool:
+
+        # 删除前必须从 SQLite 权威记录校验记忆类型与用户归属。
+        doc = self.doc_store.get_memory(memory_id)
+        if not doc or doc.get("memory_type") != self.memory_type:
+            return False
+        if user_id is not None and doc.get("user_id") != user_id:
+            return False
 
         # SQLite
         doc_deleted = self.doc_store.delete_memory(memory_id)
@@ -340,17 +353,36 @@ class EpisodicMemory(BaseMemory):
         return doc_deleted
 
 
-    def has_memory(self, memory_id: str) -> bool:
-        """检查内存中是否存在情景记忆"""
-        return any(episode.episode_id == memory_id for episode in self.episodes)
+    def has_memory(self, memory_id: str, user_id: str = None) -> bool:
+        """从 SQLite 权威存储检查情景记忆，保证进程重启后仍能正确判断。"""
+        doc = self.doc_store.get_memory(memory_id)
+        return bool(
+            doc
+            and doc.get("memory_type") == self.memory_type
+            and (user_id is None or doc.get("user_id") == user_id)
+        )
 
-    def clear(self):
+    def clear(self, user_id: str = None):
         """清空所有情景记忆（仅清理episodic，不影响其他类型）"""
-        self.episodes.clear()
-        self.sessions.clear()
+        if user_id is None:
+            self.episodes.clear()
+            self.sessions.clear()
+        else:
+            self.episodes = [
+                episode for episode in self.episodes if episode.user_id != user_id
+            ]
+            self.sessions = {}
+            for episode in self.episodes:
+                self.sessions.setdefault(episode.session_id, []).append(
+                    episode.episode_id
+                )
         self.patterns_cache.clear()
 
-        docs = self.doc_store.search_memories(memory_type=self.memory_type, limit=10000)
+        docs = self.doc_store.search_memories(
+            user_id=user_id,
+            memory_type=self.memory_type,
+            limit=1_000_000,
+        )
         ids = [d["memory_id"] for d in docs]
         for mid in ids:
             self.doc_store.delete_memory(mid)
@@ -362,8 +394,20 @@ class EpisodicMemory(BaseMemory):
             pass
 
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self, user_id: str = None) -> Dict[str, Any]:
         """获取情景记忆统计信息（合并SQLite与Qdrant）"""
+
+        if user_id is not None:
+            docs = self.doc_store.search_memories(
+                user_id=user_id,
+                memory_type=self.memory_type,
+                limit=1_000_000,
+            )
+            return {
+                "memory_type": self.memory_type,
+                "scope": "user",
+                "count": len(docs),
+            }
 
         db_stats = self.doc_store.get_database_stats()
         try:

@@ -3,21 +3,20 @@
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..base import BaseMemory, MemoryConfig, MemoryItem
 from ..embedding import get_dimension, get_embedding_model
 from ..storage.document_store import SQLiteDocumentStore
 from ..storage.qdrant_store import QdrantConnectionManager
+from ..semantic_query_planner import SemanticQueryPlanner
 from .semantic_change import FactChange
 from .semantic_fact import SemanticFact
 from .semantic_policy import PredicatePolicy, PredicatePolicyRegistry
+from .semantic_query import FactQuery, FactRetrievalMode
 
 
 logger = logging.getLogger(__name__)
-
-
-FactRetrievalMode = Literal["current", "timeline", "audit"]
 
 
 class SemanticMemory(BaseMemory):
@@ -42,6 +41,9 @@ class SemanticMemory(BaseMemory):
         self.predicate_policies = (
             backends.get("predicate_registry") or PredicatePolicyRegistry()
         )
+        # 查询规划器只负责把自然语言转换成 FactQuery；执行仍由 SemanticMemory 控制。
+        # 通过 storage_backend 注入可在未来替换成 LLM 规划器或测试替身。
+        self.query_planner = backends.get("query_planner") or SemanticQueryPlanner()
 
         db_dir = self.config.storage_path
         os.makedirs(db_dir, exist_ok=True)
@@ -647,6 +649,59 @@ class SemanticMemory(BaseMemory):
         )
         return results[:limit]
 
+    def execute_fact_query(self, fact_query: FactQuery) -> List[MemoryItem]:
+        """执行经过 Pydantic 校验的 FactQuery，作为规划器与存储层的稳定边界。"""
+        query = FactQuery.model_validate(fact_query)
+        return self.retrieve_facts(
+            user_id=query.user_id,
+            subject=query.subject,
+            predicate=query.predicate,
+            retrieval_mode=query.retrieval_mode,
+            object_value=query.object_value,
+            limit=query.limit,
+        )
+
+    def plan_query(
+        self,
+        query: str,
+        user_id: str,
+        limit: int = 5,
+        subject: str = "user",
+    ) -> Optional[FactQuery]:
+        """把自然语言问题规划为 FactQuery；无法确定谓词时返回 None。"""
+        normalized_query = self._validate_content(query)
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("自然语言记忆检索必须提供 user_id")
+        return self.query_planner.plan(
+            query=normalized_query,
+            user_id=user_id.strip(),
+            limit=limit,
+            subject=subject,
+        )
+
+    def retrieve_natural_language(
+        self,
+        query: str,
+        user_id: str,
+        limit: int = 5,
+        subject: str = "user",
+        **vector_kwargs,
+    ) -> List[MemoryItem]:
+        """自动规划自然语言问题，无法结构化时安全回退到 Qdrant。
+
+        该方法不改变原有 ``retrieve`` 的默认行为，便于调用方逐步接入查询规划器。
+        规划成功时执行 SQLite 精确查询；失败时保留完整 query 走向量召回。
+        """
+        plan = self.plan_query(query, user_id, limit=limit, subject=subject)
+        if plan is not None:
+            return self.execute_fact_query(plan)
+        return self.retrieve(
+            query=query,
+            limit=limit,
+            user_id=user_id,
+            **vector_kwargs,
+        )
+
     def retrieve(
         self,
         query: Optional[str] = None,
@@ -875,7 +930,38 @@ class SemanticMemory(BaseMemory):
         if ids and not self.vector_store.delete_memories(ids):
             logger.warning("SQLite 已清空，但部分语义记忆向量可能未清理")
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self, user_id: Optional[str] = None) -> Dict[str, Any]:
+        """返回语义记忆统计；提供 ``user_id`` 时只统计该用户的数据。
+
+        工具调用属于用户可见边界，不能返回整个数据库的用户汇总或共享 Qdrant 集合
+        信息。因此用户级统计只提供当前用户的记忆数量和事实状态分布；不提供
+        ``user_id`` 时保留原有的系统级诊断信息。
+        """
+        if user_id is not None:
+            if not isinstance(user_id, str) or not user_id.strip():
+                raise ValueError("统计语义记忆时 user_id 不能为空")
+            documents = self.doc_store.search_memories(
+                user_id=user_id.strip(),
+                memory_type=self.memory_type,
+                limit=1_000_000,
+            )
+            fact_statuses = {"active": 0, "superseded": 0, "retracted": 0}
+            structured_fact_count = 0
+            for document in documents:
+                item = self._memory_item_from_document(document)
+                fact = self.get_fact(item)
+                if fact is None:
+                    continue
+                structured_fact_count += 1
+                fact_statuses[fact.status] += 1
+            return {
+                "memory_type": self.memory_type,
+                "scope": "user",
+                "count": len(documents),
+                "structured_fact_count": structured_fact_count,
+                "fact_statuses": fact_statuses,
+            }
+
         document_stats = self.doc_store.get_database_stats()
         try:
             vector_stats = self.vector_store.get_collection_info()
